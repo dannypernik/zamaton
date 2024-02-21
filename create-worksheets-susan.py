@@ -8,40 +8,40 @@ from reportlab.lib.pagesizes import letter
 from ids import ids
 
 
-pdfFileObj = open('rw-key.pdf', 'rb')
+pdfFileObj = open('rw-questions.pdf', 'rb')
 pdfReader = PyPDF2.PdfReader(pdfFileObj)
 
 ### if relevant id object does not exist in ids.py
 
-# data = csv.reader(open('rw-ids.csv'), delimiter=',', skipinitialspace=True) 
-# ids, cats = [], []
+data = csv.reader(open('rw-all-but-sat.csv'), delimiter=',', skipinitialspace=True) 
+ids, cats = [], []
 
-# for row in data:
-#     ids.append({
-#         'id': row[0],
-#         'cat': row[1],
-#         'page': None,
-#         'page2': False,
-#     })
+for row in data:
+    ids.append({
+        'id': row[0],
+        'cat': row[1],
+        'page': None,
+        'page2': False,
+    })
 
-#     if row[1] not in cats:
-#         cats.append(row[1])
+    if row[1] not in cats:
+        cats.append(row[1])
 
-# for p in range(len(pdfReader.pages)):
-#     pageObj = pdfReader.pages[p]
-#     pageText = pageObj.extract_text()
-#     if p < len(pdfReader.pages) - 1:
-#         nextPageObj = pdfReader.pages[p + 1]
-#     nextText = nextPageObj.extract_text()
-#     for id in ids:
-#         if pageText.find("Question ID") != -1 and pageText.find(id['id']) != -1:
-#             id['page'] = p
-#             if nextText.find("Question ID") == -1:
-#                 id['page2'] = True
-#             print(datetime.datetime.now().strftime(format='%H:%M'), id['id'], id['page'], id['page2'])
-#             break
+for p in range(len(pdfReader.pages)):
+    pageObj = pdfReader.pages[p]
+    pageText = pageObj.extract_text()
+    if p < len(pdfReader.pages) - 1:
+        nextPageObj = pdfReader.pages[p + 1]
+    nextText = nextPageObj.extract_text()
+    for id in ids:
+        if pageText.find("Question ID") != -1 and pageText.find(id['id']) != -1:
+            id['page'] = p
+            if nextText.find("Question ID") == -1:
+                id['page2'] = True
+            print(datetime.datetime.now().strftime(format='%H:%M'), id['id'], id['page'], id['page2'])
+            break
 
-# print(ids)
+print(ids)
 
 
 ### Linear test unique Qs
@@ -111,25 +111,26 @@ pdfReader = PyPDF2.PdfReader(pdfFileObj)
 
 ### If relevant id object exists in ids.py
 
-cats = []
+# cats = []
 
-for id in ids:
-    if id['cat'] not in cats:
-        cats.append(id['cat'])
+# for id in ids:
+#     if id['cat'] not in cats:
+#         cats.append(id['cat'])
 
+### Create PDFs
 
 for cat in cats:
-    folder = "Reading & Writing/" + cat[0:len(cat)-2]
+    folder = "RW PSAT safe/" + cat[0:len(cat)-2]
     if not os.path.exists(folder):
         os.makedirs(folder)
-    pdfWriter = PyPDF2.PdfWriter()
     qNum = 1
+    pdfWriter = PyPDF2.PdfWriter()
     for id in ids:
         if id['cat'] == cat:
             packet = io.BytesIO()
             can = canvas.Canvas(packet, pagesize=letter)
-            qId = id['cat'][len(id['cat'])-1] + "." + str(qNum)
-            can.drawString(558, 743, qId)
+            qId = str(qNum) # id['cat'][len(id['cat'])-1] + "." + str(qNum)
+            can.drawString(558, 748, qId)
             can.save()
             #move to the beginning of the StringIO buffer
             packet.seek(0)
@@ -137,6 +138,12 @@ for cat in cats:
             # create a new PDF with Reportlab
             new_pdf = PyPDF2.PdfReader(packet)
             print(qId)
+            if id['page'] is None:
+                for i in ids:
+                    if i['id'] == id['id']:
+                        id['page'] = i['page']
+                        id['page2'] = i['page2']
+                        break
             pageObj = pdfReader.pages[id['page']]
             pageObj.merge_page(new_pdf.pages[0])
 
@@ -148,11 +155,9 @@ for cat in cats:
                 print("page 2 added")
             
             qNum += 1
-            packet = None
 
-    pdfOutput = open(folder + "/_" + cat + '~Key.pdf', 'wb')
+    pdfOutput = open(folder + "/" + cat + '.pdf', 'wb')
     pdfWriter.write(pdfOutput)
     pdfOutput.close()
     print(cat + " complete!")
 print("worksheets complete!")
-
