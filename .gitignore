@@ -6,3 +6,10 @@
 /clients/
 /questions/
 extract_images.py
+/archive/
+/figures/
+/question-images/
+/math-worksheets/
+/rw-worksheets/
+/practice-tests/
+*.json
