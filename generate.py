@@ -192,24 +192,81 @@ def _italic_span_to_mi(m: re.Match) -> str:
     return f'<span style="font-style:italic">{inner}</span>{suffix}'
 
 
+_MATHML_TAG = re.compile(r"<(/?)([a-zA-Z][\w:.-]*)([^>]*?)(/?)>", re.DOTALL)
+
+# Innermost <mfenced> first: the body may not contain another <mfenced> opener,
+# so nesting like f(g(x)) unwraps from the inside out.
+_MFENCED = re.compile(
+    r"<mfenced\b([^>]*)>((?:(?!<mfenced\b).)*?)</mfenced>", re.DOTALL
+)
+
+
+def _top_level_children(content: str) -> list[str]:
+    """Split MathML markup into its top-level child elements.
+
+    Text between elements (whitespace, entities) is dropped — <mfenced>
+    children are always elements, and its arguments are exactly those.
+    """
+    children: list[str] = []
+    depth = 0
+    start = 0
+    for m in _MATHML_TAG.finditer(content):
+        closing, self_closing = m.group(1), m.group(4)
+        if closing:
+            depth -= 1
+            if depth == 0:
+                children.append(content[start:m.end()])
+        elif self_closing:
+            if depth == 0:
+                children.append(m.group(0))
+        else:
+            if depth == 0:
+                start = m.start()
+            depth += 1
+    return children
+
+
 def fix_mfenced(html: str) -> str:
-    """Chromium (MathML Core) dropped <mfenced>; replace with explicit <mo> brackets."""
+    """Chromium (MathML Core) dropped <mfenced>; replace with explicit <mo> brackets.
+
+    <mfenced> with several children separates them — a coordinate pair
+    <mfenced><mn>0</mn><mn>22</mn></mfenced> means "(0, 22)". Concatenating
+    the children instead renders it as "(022)", so the separators (default
+    ",", overridable via the separators attribute) are emitted explicitly.
+    """
     def replacer(m: re.Match) -> str:
         attrs, content = m.group(1), m.group(2)
         o_m = re.search(r"""open=['"]([^'"]*)['"]""", attrs)
         c_m = re.search(r"""close=['"]([^'"]*)['"]""", attrs)
+        s_m = re.search(r"""separators=['"]([^'"]*)['"]""", attrs)
         o = o_m.group(1) if o_m else "("
         c = c_m.group(1) if c_m else ")"
+
+        children = _top_level_children(content)
+        if len(children) > 1:
+            # Per the MathML spec the separators attribute is a character list,
+            # one per gap; the last one repeats if there are fewer than gaps.
+            # Whitespace-only (or absent) means "no separator at all".
+            seps = "".join((s_m.group(1) if s_m else ",").split())
+            body = children[0]
+            for i, child in enumerate(children[1:]):
+                if seps:
+                    sep = seps[i] if i < len(seps) else seps[-1]
+                    body += f"<mo>{sep}</mo>"
+                body += child
+        else:
+            body = content
+
         return (
             f'<mrow><mo stretchy="false">{o}</mo>'
-            f"<mrow>{content}</mrow>"
+            f"<mrow>{body}</mrow>"
             f'<mo stretchy="false">{c}</mo></mrow>'
         )
 
     prev = None
     while prev != html:
         prev = html
-        html = re.sub(r"<mfenced([^>]*)>(.*?)</mfenced>", replacer, html, flags=re.DOTALL)
+        html = _MFENCED.sub(replacer, html)
     return html
 
 
@@ -685,12 +742,43 @@ p:last-child {{ margin-bottom: 0; }}
 math {{ font-size: 1.15em !important; line-height: 1; }}
 mi, mn, mtext, ms, mo, mspace {{ font-size: 1em !important; }}
 .answer-text math {{ font-size: 1.2em !important; }}
+/* Script positions. The token reset above is !important, so it also cancels
+   Chromium's automatic script shrinking (font-size: math) on a script written
+   as a bare <mn>/<mi> — "a^132" then renders the exponent at full size while
+   an <mrow>-wrapped one shrinks. Size the script slots explicitly, and with
+   !important, so both spellings come out the same. The root index sits two
+   script levels down (0.55em is what Chromium computes for it unaided). */
 msup > *:nth-child(2),
 msub > *:nth-child(2),
-msubsup > *:nth-child(3) {{ font-size: 0.82em; }}
+msubsup > *:nth-child(2),
+msubsup > *:nth-child(3) {{ font-size: 0.82em !important; }}
+mroot > *:nth-child(2) {{ font-size: 0.55em !important; }}
 /* Fraction bar breathing room */
 mfrac > *:first-child {{ padding-bottom: 0.12em; }}
 mfrac > *:last-child  {{ padding-top: 0.12em; }}
+
+/* Radicals — Chromium lays out <msqrt>/<mroot> from the font's OpenType MATH
+   table (radical gaps, bar thickness, degree kerning). Noto Serif has no MATH
+   table, so the radical sign is an unpositioned fallback glyph: the bar misses
+   the radicand and an <mroot> index collides with the radical. Draw the radical
+   itself in a math font and put the body face back on the contents, so only the
+   radical sign changes and the rest of the expression stays Noto Serif. */
+msqrt, mroot {{
+  font-family: 'STIX Two Math', 'Latin Modern Math', 'Cambria Math', math;
+}}
+msqrt *, mroot * {{ font-family: 'Noto Serif', Times, serif; }}
+/* …but a nested radical needs the math font back (any depth). */
+msqrt msqrt, msqrt mroot, mroot msqrt, mroot mroot {{
+  font-family: 'STIX Two Math', 'Latin Modern Math', 'Cambria Math', math;
+}}
+
+/* A fraction exponent (t^(9/7)) gets only the plain superscript shift, which
+   leaves the denominator sitting on the base's baseline — it reads as "t7"
+   with a stray 9. Bottom padding lifts the fraction clear of the base; unlike
+   a relative offset it grows the box too, so the numerator can't spill out of
+   the line above (or off the top of a cropped question image). */
+msup > mfrac:nth-child(2),
+msubsup > mfrac:nth-child(3) {{ padding-bottom: 0.5em; }}
 
 /* ── MCQ: extra space below question block for scratch work ── */
 .question-block.question-mcq {{
@@ -954,13 +1042,6 @@ _DOM_FIXUPS = """() => {
                 p.style.padding = '0';
             }
         }
-    });
-    document.querySelectorAll('msqrt').forEach(el => {
-        el.style.setProperty('position', 'relative');
-        el.style.setProperty('top', '-0.18em');
-        [...el.children].forEach(child => {
-            child.style.setProperty('transform', 'translateY(0.18em)');
-        });
     });
     // Expand a chart svg's viewBox so rotated content (e.g. long angled axis
     // labels) is never clipped. _move_svg_legend_right's height estimate is a
