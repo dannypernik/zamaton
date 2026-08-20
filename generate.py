@@ -36,14 +36,12 @@ from pypdf import PdfWriter, PdfReader
 # ══════════════════════════════════════════════════════════════════════════════
 
 _REPO     = Path(__file__).resolve().parent
-_TP       = _REPO.parent / "test-prep-analysis/src/data"
+_TP       = _REPO.parent / "tpa/score-estimator/questions"
 _FONT_DIR = Path.home() / "Library/Fonts"
 
 _FIGURES   = _REPO / "question-images/figures"
-_MATH_BANK = _TP / "math-question-bank.json"
-_RW_BANK   = _TP / "reading-question-bank.json"
-_PT_JSON   = _TP / "practice-test-questions.json"
-
+_MATH_BANK = _REPO / "math-question-bank.json"
+_RW_BANK   = _REPO / "reading-question-bank.json"
 _MATH_EXPL = _REPO / "math-question-bank-explanations.json"
 _RW_EXPL   = _REPO / "reading-question-bank-explanations.json"
 
@@ -60,10 +58,29 @@ _PSAT_TESTS = ["PSAT1", "PSAT2"]
 _ALL_TESTS  = _SAT_TESTS + _PSAT_TESTS
 _MODULE_ORDER = [("RW", 1), ("RW", 2), ("RW", 3), ("M", 1), ("M", 2), ("M", 3)]
 
-# Source/code prefixes that indicate a live (unreleased) test question → tombstone.
-# SAT1-3 are published practice tests whose questions can appear in worksheets;
-# SAT4+ and PSAT are live/unreleased tests.
-_LIVE_SRC = re.compile(r"^(SAT[4-9]|SAT[1-9][0-9]|PSAT)", re.IGNORECASE)
+# A skill code's leading whitespace-separated token identifies it as a
+# practice-test question when it's exactly SAT#, PSAT#, or SLT# (1-2 digit
+# test number) — e.g. "SAT9 M 2.14" or "SLT11 RW 1.6" ("Area and Volume 1.13"
+# is not a test code, so this returns None for it).
+_TEST_CODE_TOKEN = re.compile(r"^(SAT|PSAT|SLT)(\d{1,2})$", re.IGNORECASE)
+
+
+def _test_code_status(code: str) -> str | None:
+    """Classify a skill code by its leading token.
+
+    Returns 'published' for SAT1-3 (safe to show on concept worksheets),
+    'live' for SAT4+, PSAT#, or SLT# (unreleased — tombstone on concept
+    worksheets), or None if the code isn't a practice-test code at all.
+    """
+    token = code.strip().split(None, 1)[0] if code.strip() else ""
+    m = _TEST_CODE_TOKEN.match(token)
+    if not m:
+        return None
+    prefix, num = m.group(1).upper(), int(m.group(2))
+    if prefix == "SAT" and num <= 3:
+        return "published"
+    return "live"
+
 
 # Base URL for question image fallbacks (used when an ID is not in the JSON bank)
 _OPEN_PATH_IMG = "https://www.openpathtutoring.com/static/img/concepts/sat"
@@ -277,6 +294,20 @@ def is_empty_html(html: str) -> bool:
     return not re.sub(r"<[^>]+>", "", html).strip()
 
 
+def _answers_need_grid(answers: dict) -> bool:
+    """True when any answer choice contains a table, graph (svg), or a
+    full-size raster diagram (an <img> that isn't a small inline math-img
+    expression) — all wide enough that a single vertical column of A-D
+    wastes horizontal space."""
+    for html in answers.values():
+        if re.search(r'<table\b|<svg\b', html, re.IGNORECASE):
+            return True
+        for img_m in re.finditer(r'<img\b[^>]*>', html, re.IGNORECASE):
+            if 'math-img' not in img_m.group(0):
+                return True
+    return False
+
+
 def _wrap_final_punct(html: str) -> str:
     """Bind punctuation to the preceding item so it never starts a new line."""
     _P = r'[.,:;?]'
@@ -379,8 +410,8 @@ def _move_svg_legend_right(svg: str) -> str:
     y_hi = legend_y + legend_h + 10
 
     for el_m in re.finditer(
-        r'<(?:line|rect|text|path|circle|polygon|polyline)\b[^>]*'
-        r'(?:/>|>(?:.*?)</(?:line|rect|text|path|circle|polygon|polyline)>)?',
+        r'<(line|rect|text|path|circle|polygon|polyline)\b[^>]*/>'
+        r'|<(line|rect|text|path|circle|polygon|polyline)\b[^>]*>.*?</\2>',
         after_border, re.DOTALL | re.IGNORECASE,
     ):
         el = el_m.group(0)
@@ -539,7 +570,7 @@ def prep_html(html: str, math_mode: bool = True) -> str:
 # WORKSHEET / PRACTICE-TEST: CSS + HTML
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _worksheet_css(font_dir: Path) -> str:
+def _worksheet_css(font_dir: Path, page_bottom_margin_in: float = 0.65) -> str:
     fd = str(font_dir).replace("\\", "/")
     return f"""
 @font-face {{
@@ -560,7 +591,7 @@ def _worksheet_css(font_dir: Path) -> str:
 
 @page {{
   size: letter;
-  margin: 0.45in 0.9in 0.65in 0.9in;
+  margin: 0.45in 0.9in {page_bottom_margin_in}in 0.9in;
 }}
 
 *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
@@ -649,10 +680,13 @@ img.math-img {{
   font-style: italic;
   white-space: nowrap;
 }}
-/* figure.image img overrides the inline rule above */
+/* figure.image img overrides the inline rule above.
+   height/width both auto + max-height/max-width both capped is required —
+   pairing a fixed height with a max-width clamps width alone on wide-aspect
+   rasters, squishing them instead of scaling both dimensions proportionally. */
 figure.image img {{
-  height: 130pt !important;
-  max-height: 180pt !important;
+  height: auto !important;
+  max-height: 155pt !important;
   width: auto !important;
   vertical-align: initial !important;
 }}
@@ -671,13 +705,13 @@ figure.image {{
   text-align: center;
 }}
 figure.image img {{
-  height: 130pt;
+  height: auto;
   max-width: 70%;
   width: auto;
   display: inline-block;
 }}
 figure.image svg {{
-  max-height: 180pt !important;
+  max-height: 210pt !important;
   max-width: 70% !important;
   width: auto !important;
   display: inline-block;
@@ -738,6 +772,17 @@ p[style*="text-align:center"]  img.math-img {{
 }}
 p:last-child {{ margin-bottom: 0; }}
 
+/* Lists — the universal reset above (margin:0; padding:0;) strips the
+   indentation list markers render in, so bullets/numbers end up hidden
+   at the left edge. Restore standard indentation. */
+ul, ol {{
+  margin: 0 0 8pt 0;
+  padding-left: 20pt;
+}}
+ul:last-child, ol:last-child {{ margin-bottom: 0; }}
+li {{ margin-bottom: 2pt; }}
+li:last-child {{ margin-bottom: 0; }}
+
 /* MathML — boost slightly to compensate for math font optical size vs body serif */
 math {{ font-size: 1.15em !important; line-height: 1; }}
 mi, mn, mtext, ms, mo, mspace {{ font-size: 1em !important; }}
@@ -782,7 +827,7 @@ msubsup > mfrac:nth-child(3) {{ padding-bottom: 0.5em; }}
 
 /* ── MCQ: extra space below question block for scratch work ── */
 .question-block.question-mcq {{
-  margin-bottom: 22pt;
+  margin-bottom: 33pt;
 }}
 
 /* ── SPR: more space below + answer box ──────────────── */
@@ -816,6 +861,18 @@ msubsup > mfrac:nth-child(3) {{ padding-bottom: 0.5em; }}
   min-width: 175pt;
   max-width: 98%;
   gap: 5pt;
+}}
+/* Answer choices containing a table or graph run wide — lay A/B and C/D
+   out as two columns (A above B, C above D) instead of one tall stack. */
+.answers-list.answers-grid {{
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  grid-template-rows: repeat(2, auto);
+  grid-auto-flow: column;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  gap: 5pt 10pt;
 }}
 .answer-choice {{
   display: table;
@@ -898,7 +955,10 @@ def build_worksheet_html(
     math_mode: bool = True,
 ) -> str:
     """Return a full HTML document for one worksheet or practice-test module."""
-    css = _worksheet_css(font_dir)
+    # Math worksheets compute their own bottom margin per-question (see
+    # _BALANCE_SCRATCH_SPACE) — a nonzero @page bottom margin would stack on
+    # top of that and double-count blank space at the bottom of the page.
+    css = _worksheet_css(font_dir, page_bottom_margin_in=0 if math_mode else 0.65)
     diff_num = _DIFFICULTY_ORDINAL.get(difficulty, 1)
     if page_subtitle is None:
         page_subtitle = f"{_display_name(skill)} {diff_num}"
@@ -906,15 +966,16 @@ def build_worksheet_html(
 
     blocks_html = ""
     for q_num, q_id, q in questions:
-        label = f"{prefix}.{q_num}"
+        label = f"{prefix}.{q_num}" if prefix else str(q_num)
         if q.get("_tombstone"):
+            note = q.get("_tombstone_note", "Removed. Appears on a practice test.")
             blocks_html += f"""
       <div class="question-block question-tombstone">
         <div class="question-header">
           <span class="question-number">{label}</span>
           <span class="question-id">{q_id}</span>
         </div>
-        <div class="tombstone-text">Removed. Appears on a practice test.</div>
+        <div class="tombstone-text">{note}</div>
       </div>"""
             continue
 
@@ -952,7 +1013,8 @@ def build_worksheet_html(
             <div class="answer-letter-cell"><span class="answer-letter">{letter}</span></div>
             <div class="answer-text">{answers[letter]}</div>
           </div>"""
-            answers_section = f'<div class="answers-list">{choices_html}\n        </div>'
+            grid_class = " answers-grid" if _answers_need_grid(answers) else ""
+            answers_section = f'<div class="answers-list{grid_class}">{choices_html}\n        </div>'
             block_class = "question-mcq"
         else:
             answers_section = '<div class="spr-answer-box"><div class="spr-answer-line"></div></div>'
@@ -1077,6 +1139,71 @@ _DOM_FIXUPS = """() => {
     });
 }"""
 
+# The @page rule below prints at Letter size with 0.9in side margins, so the
+# true usable content width is 8.5in - 0.9in - 0.9in = 6.7in = 643px (96 CSS
+# px/in). Chromium only applies that narrower layout internally during PDF
+# generation — a page.evaluate() beforehand still sees the browser's normal
+# viewport (1200px in this pipeline). _BALANCE_SCRATCH_SPACE measures answer
+# widths to decide how much margin to add, so it must run with the viewport
+# temporarily resized to this value, or every ratio it computes is wrong.
+PRINT_CONTENT_WIDTH_PX = 643
+
+# Balanced scratch-space margin: split the blank area a question leaves
+# between the strip to the right of its answers and the strip below the
+# block, so every question gets roughly the same total scratch area no
+# matter how wide its answers happen to render. Short/narrow answers
+# already leave a wide right-hand strip, so they need less margin below;
+# full-width answers leave ~none, so they need more margin below to
+# compensate. Grid layouts (graphs/tables/images) keep the flat default.
+#
+# Must run with the viewport set to PRINT_CONTENT_WIDTH_PX (see above) —
+# call via _balance_scratch_space(page), not page.evaluate() directly.
+_BALANCE_SCRATCH_SPACE = """() => {
+    const CAP = 144;      // pt — margin when answers span the full width
+    const FLOOR = 60;     // pt — margin when answers leave a wide right gap
+    const PT_PER_PX = 0.75; // 72pt/in ÷ 96px/in
+    document.querySelectorAll('.question-block').forEach(block => {
+        if (block.closest('.ak-entry')) return; // answer key keeps its fixed margin
+        const isMcq = block.classList.contains('question-mcq');
+        const isSpr = block.classList.contains('question-spr');
+        if (!isMcq && !isSpr) return;
+        let answersEl = null;
+        if (isMcq) {
+            if (block.querySelector('.answers-list.answers-grid')) return; // grid keeps default
+            answersEl = block.querySelector('.answers-list');
+        } else {
+            answersEl = block.querySelector('.spr-answer-box');
+        }
+        if (!answersEl) return;
+        const cs = getComputedStyle(block);
+        const padL = parseFloat(cs.paddingLeft) || 0;
+        const padR = parseFloat(cs.paddingRight) || 0;
+        const contentWidth = block.clientWidth - padL - padR;
+        if (contentWidth <= 0) return;
+        const answersRect = answersEl.getBoundingClientRect();
+        const rightGapPx = Math.max(0, contentWidth - answersRect.width);
+        const rightAreaPx = rightGapPx * answersRect.height;
+        const marginPt = CAP - (rightAreaPx / contentWidth) * PT_PER_PX;
+        block.style.setProperty(
+            'margin-bottom',
+            `${Math.min(CAP, Math.max(FLOOR, marginPt))}pt`,
+            'important',
+        );
+    });
+}"""
+
+
+async def _balance_scratch_space(page) -> None:
+    """Run _BALANCE_SCRATCH_SPACE at the true print content width, then
+    restore whatever viewport the page had (page.pdf() ignores viewport size
+    entirely, but the page object is reused across renders in worker loops,
+    so other code downstream shouldn't see it changed)."""
+    original = page.viewport_size
+    await page.set_viewport_size({"width": PRINT_CONTENT_WIDTH_PX, "height": (original or {}).get("height", 900)})
+    await page.evaluate(_BALANCE_SCRATCH_SPACE)
+    if original:
+        await page.set_viewport_size(original)
+
 
 async def render_one(page, q_id: str, question: dict, out_dir: Path) -> None:
     html = build_worksheet_html(
@@ -1120,6 +1247,7 @@ async def render_worksheet(
     html = build_worksheet_html(skill, difficulty, questions, font_dir, **html_kwargs)
     await page.set_content(html, wait_until="networkidle")
     await page.evaluate(_DOM_FIXUPS)
+    await _balance_scratch_space(page)
 
     diff_num = _DIFFICULTY_ORDINAL.get(difficulty, 1)
     filename = pdf_filename or f"{_display_name(skill)} {diff_num}.pdf"
@@ -1167,7 +1295,7 @@ def build_answer_key_html(
 
 /* ── Per-entry spacing ─────────────────────────────────────────────── */
 .ak-entry {
-  margin-bottom: 20pt;
+  margin-bottom: 33pt;
 }
 
 /* No SPR box in answer key — hide it */
@@ -1240,6 +1368,7 @@ def build_answer_key_html(
         is_tombstone = q.get("_tombstone", False)
 
         if is_tombstone:
+            note = q.get("_tombstone_note", "Removed. Appears on a practice test.")
             entries_html += f"""
 <div class="ak-entry">
   <div class="question-block question-tombstone">
@@ -1247,7 +1376,7 @@ def build_answer_key_html(
       <span class="question-number">{label}</span>
       <span class="question-id">{qid}</span>
     </div>
-    <div class="tombstone-text">Removed. Appears on a practice test.</div>
+    <div class="tombstone-text">{note}</div>
   </div>
 </div>"""
             continue
@@ -1297,7 +1426,8 @@ def build_answer_key_html(
             <div class="answer-letter-cell"><span class="answer-letter">{letter}</span></div>
             <div class="answer-text">{answers_prep[letter]}</div>
           </div>"""
-            answers_section = f'<div class="answers-list">{choices_html}\n        </div>'
+            grid_class = " answers-grid" if _answers_need_grid(answers_prep) else ""
+            answers_section = f'<div class="answers-list{grid_class}">{choices_html}\n        </div>'
             block_class = "question-mcq"
         else:
             answers_section = '<div class="spr-answer-box"><div class="spr-answer-line"></div></div>'
@@ -1382,6 +1512,7 @@ async def render_answer_key(
     )
     await page.set_content(html, wait_until="networkidle")
     await page.evaluate(_DOM_FIXUPS)
+    await _balance_scratch_space(page)
     await page.pdf(
         path=str(out_dir / pdf_filename),
         format="Letter",
@@ -1548,10 +1679,33 @@ async def run_images(args, math_questions: dict, rw_questions: dict) -> None:
     math_dir.mkdir(parents=True, exist_ok=True)
     rw_dir.mkdir(parents=True, exist_ok=True)
 
+    no_svg_data: list[tuple[str, bool]] = []  # (qid, fallback_available)
     if args.ids:
         id_set = {i.strip() for i in args.ids.split(",")}
         math_questions = {k: v for k, v in math_questions.items() if k in id_set}
         rw_questions   = {k: v for k, v in rw_questions.items()   if k in id_set}
+
+        # IDs not present in either local bank — try the openpathtutoring
+        # fallback image directly (no Playwright round-trip needed, it's
+        # already a rendered image) instead of silently producing nothing.
+        unresolved = id_set - set(math_questions) - set(rw_questions)
+        for qid in sorted(unresolved):
+            saved = False
+            for subject, out_subdir in (("math", math_dir), ("rw", rw_dir)):
+                img_bytes = _fetch_image_fallback(qid, subject)
+                if img_bytes:
+                    (out_subdir / f"{qid}.jpg").write_bytes(img_bytes)
+                    no_svg_data.append((qid, True))
+                    saved = True
+                    break
+            if not saved:
+                no_svg_data.append((qid, False))
+
+    if no_svg_data:
+        print(f"Question(s) without SVG data ({len(no_svg_data)}):")
+        for qid, has_fb in no_svg_data:
+            status = "fallback image saved" if has_fb else "NO FALLBACK — skipped"
+            print(f"  {qid} — {status}")
 
     math_items = list(math_questions.items())
     rw_items   = list(rw_questions.items())
@@ -1571,7 +1725,9 @@ async def run_images(args, math_questions: dict, rw_questions: dict) -> None:
         )
         await browser.close()
 
-    print(f"\nDone! {len(progress)}/{total} images saved to: {base_dir}/ (math/ and rw/)")
+    fallback_saved = sum(1 for _, has_fb in no_svg_data if has_fb)
+    print(f"\nDone! {len(progress) + fallback_saved}/{total + len(no_svg_data)} "
+          f"images saved to: {base_dir}/ (math/ and rw/)")
 
     if getattr(args, "regen_worksheets", False):
         regen_ids = set(math_questions) | set(rw_questions)
@@ -1593,11 +1749,8 @@ async def run_images(args, math_questions: dict, rw_questions: dict) -> None:
 async def run_math_worksheets(args, all_questions: dict, regen_ids: set | None = None) -> None:
     master_rows = load_master_csv()
 
-    _ANY_TEST_CODE  = re.compile(r"^(SAT|SLT|PSAT)", re.IGNORECASE)
-    _LIVE_TEST_CODE = re.compile(r"^(SAT[4-9]|SAT[1-9][0-9]|PSAT|SLT)", re.IGNORECASE)
-
     slot_map:       dict = defaultdict(dict)
-    live_test_ids:  set  = set()
+    live_test_ids:  dict = {}   # qid → True if SLT-coded, False if SAT/PSAT-coded
     all_master_ids: set  = set()
 
     sheet_answers: dict[str, str] = {}   # qid → correct answer from spreadsheet
@@ -1611,9 +1764,11 @@ async def run_math_worksheets(args, all_questions: dict, regen_ids: set | None =
         if ans:
             sheet_answers[qid] = ans
 
-        if _LIVE_TEST_CODE.match(code):
-            live_test_ids.add(qid)
-        if _ANY_TEST_CODE.match(code):
+        status = _test_code_status(code)
+        if status == "live":
+            is_slt = code.strip().split(None, 1)[0].upper().startswith("SLT")
+            live_test_ids[qid] = live_test_ids.get(qid, False) or is_slt
+        if status is not None:
             continue
 
         m = re.match(r"^(.+?)\s+(\d+)\.(\d+)$", code)
@@ -1625,8 +1780,8 @@ async def run_math_worksheets(args, all_questions: dict, regen_ids: set | None =
         if q_num not in slot_map[(skill_d, diff_n)]:
             slot_map[(skill_d, diff_n)][q_num] = qid
 
-    tombstone_ids = {
-        qid
+    tombstone_ids = {   # qid → True if SLT-coded, False if SAT/PSAT-coded
+        qid: live_test_ids[qid]
         for slots in slot_map.values()
         for qid in slots.values()
         if qid in live_test_ids
@@ -1670,7 +1825,16 @@ async def run_math_worksheets(args, all_questions: dict, regen_ids: set | None =
         for q_num in sorted(slots.keys()):
             qid = slots[q_num]
             if qid in tombstone_ids:
-                qs.append((q_num, qid, {"_tombstone": True, "correct": sheet_answers.get(qid, "")}))
+                note = (
+                    "Appears on a linear practice test. See SLT M Uniques worksheet."
+                    if tombstone_ids[qid] else
+                    "Removed. Appears on a practice test."
+                )
+                qs.append((q_num, qid, {
+                    "_tombstone": True,
+                    "correct": sheet_answers.get(qid, ""),
+                    "_tombstone_note": note,
+                }))
             else:
                 q = all_questions.get(qid)
                 if q is None:
@@ -1743,6 +1907,15 @@ async def run_math_worksheets(args, all_questions: dict, regen_ids: set | None =
             _worksheet_worker(browser, chunk, process_fn, progress)
             for chunk in _chunk(groups, args.workers)
         ])
+
+        if args.skill is None and regen_ids is None:
+            context = await browser.new_context(viewport={"width": 1200, "height": 900})
+            slt_page = await context.new_page()
+            await _render_slt_uniques(
+                slt_page, "Math", all_questions, "math", out_dir, "SAT Math",
+                _MATH_EXPL, True, sheet_answers, master_rows, args.keys_only,
+            )
+
         await browser.close()
 
     print(f"\nDone! {len(progress)}/{total} worksheets saved to: {out_dir}/")
@@ -1762,7 +1935,7 @@ async def run_rw_worksheets(args, rw_questions: dict, regen_ids: set | None = No
     slot_map   = defaultdict(dict)  # (skill, diff_n) → {q_num: qid}
     master_ids = set()
 
-    live_src_ids: set[str] = set()
+    live_src_ids: dict = {}   # qid → True if SLT-coded, False if SAT/PSAT-coded
     sheet_answers: dict[str, str] = {}   # qid → correct answer from spreadsheet
 
     for row in master_rows:
@@ -1770,16 +1943,16 @@ async def run_rw_worksheets(args, rw_questions: dict, regen_ids: set | None = No
             continue
         qid  = row["ID"].strip()
         code = row.get("Skill code", "").strip()
-        src  = row.get("Source", "").strip()
         ans  = row.get("Answer", "").strip()
         master_ids.add(qid)
         if ans:
             sheet_answers[qid] = ans
 
-        # SAT4+ and PSAT are live/unreleased → tombstone.
+        # SAT4+, PSAT#, and SLT# are live/unreleased → tombstone.
         # SAT1-3 are published practice tests → include normally.
-        if src and _LIVE_SRC.match(src):
-            live_src_ids.add(qid)
+        if _test_code_status(code) == "live":
+            is_slt = code.strip().split(None, 1)[0].upper().startswith("SLT")
+            live_src_ids[qid] = live_src_ids.get(qid, False) or is_slt
 
         m = re.match(r"^(.+?)\s+(\d+)\.(\d+)$", code)
         if not m:
@@ -1791,8 +1964,8 @@ async def run_rw_worksheets(args, rw_questions: dict, regen_ids: set | None = No
         q_num   = int(m.group(3))
         slot_map[(skill_c, diff_n)][q_num] = qid
 
-    tombstone_ids = {
-        qid
+    tombstone_ids = {   # qid → True if SLT-sourced, False if SAT/PSAT-sourced
+        qid: live_src_ids[qid]
         for slots in slot_map.values()
         for qid in slots.values()
         if qid in live_src_ids
@@ -1831,7 +2004,16 @@ async def run_rw_worksheets(args, rw_questions: dict, regen_ids: set | None = No
         for q_num in sorted(slots.keys()):
             qid = slots[q_num]
             if qid in tombstone_ids:
-                qs.append((q_num, qid, {"_tombstone": True, "correct": sheet_answers.get(qid, "")}))
+                note = (
+                    "Appears on a linear practice test. See SLT RW Uniques worksheet."
+                    if tombstone_ids[qid] else
+                    "Removed. Appears on a practice test."
+                )
+                qs.append((q_num, qid, {
+                    "_tombstone": True,
+                    "correct": sheet_answers.get(qid, ""),
+                    "_tombstone_note": note,
+                }))
             else:
                 q = rw_questions.get(qid)
                 if q is None:
@@ -1875,11 +2057,14 @@ async def run_rw_worksheets(args, rw_questions: dict, regen_ids: set | None = No
 
     async def process_fn(page, item):
         skill, diff_n, qs = item
-        safe     = skill.replace(",", "")
+        # "Text, Structure, and Purpose" filenames drop the comma; every
+        # other skill name (including "Form, Structure, and Sense") keeps
+        # its comma as-is in filenames. Not a general rule — just this one.
+        file_skill = "Text Structure and Purpose" if skill == "Text, Structure, and Purpose" else skill
         subtitle = f"{skill} {diff_n}"
         labelled = [(f"{diff_n}.{q_num}", qid, q) for q_num, qid, q in qs]
-        ws_name = f"-{safe} {diff_n}.pdf"
-        ak_name = f"-{safe} {diff_n}~Key.pdf"
+        ws_name = f"-{file_skill} {diff_n}.pdf"
+        ak_name = f"-{file_skill} {diff_n}~Key.pdf"
         if not args.keys_only:
             await render_worksheet(
                 page, skill, "", qs, out_dir, font_dir,
@@ -1911,6 +2096,16 @@ async def run_rw_worksheets(args, rw_questions: dict, regen_ids: set | None = No
             _worksheet_worker(browser, chunk, process_fn, progress)
             for chunk in _chunk(groups, args.workers)
         ])
+
+        if args.skill is None and regen_ids is None:
+            context = await browser.new_context(viewport={"width": 1200, "height": 900})
+            slt_page = await context.new_page()
+            await _render_slt_uniques(
+                slt_page, "Reading & Writing", rw_questions, "rw", out_dir,
+                "SAT Reading & Writing", _RW_EXPL, False, sheet_answers,
+                master_rows, args.keys_only,
+            )
+
         await browser.close()
 
     # Write new skill-code assignments CSV
@@ -1931,6 +2126,139 @@ async def run_rw_worksheets(args, rw_questions: dict, regen_ids: set | None = No
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# RUN: SLT UNIQUES
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _render_slt_uniques(
+    page,
+    subj_name: str,        # "Math" or "Reading & Writing"
+    bank: dict,
+    fallback_subj: str,    # "math" or "rw"
+    out_dir: Path,
+    page_title: str,
+    expl_path: Path,
+    math_mode: bool,
+    sheet_answers: dict,
+    master_rows: list,
+    keys_only: bool,
+) -> None:
+    """Build the combined 'SLT Uniques' worksheet + answer key for one subject
+    from every master spreadsheet row whose Skill code starts with 'SLT', in
+    spreadsheet order.
+
+    Subject is taken from the Subject column, which — verified against
+    actual question-bank membership — is 100% reliable for SLT rows. (The
+    SLT skill code's own embedded RW/M token is NOT reliable: it disagrees
+    with which bank the question actually lives in for 84 of 177 SLT rows,
+    so it must not be used to determine subject.)
+    """
+    font_dir = _FONT_DIR
+    subj_abbr = "M" if subj_name == "Math" else "RW"
+    rows = [
+        r for r in master_rows
+        if r.get("Skill code", "").strip().upper().startswith("SLT")
+        and r.get("Subject", "").strip() == subj_name
+    ]
+    if not rows:
+        return
+
+    qs: list = []
+    no_svg_data: list[tuple[str, str, bool]] = []  # (qid, skill_code, fallback_available)
+    for row in rows:
+        qid  = row.get("ID", "").strip()
+        code = row.get("Skill code", "").strip()
+        q = bank.get(qid)
+        if q is None:
+            fb = _image_fallback_question(qid, fallback_subj)
+            if fb:
+                no_svg_data.append((qid, code, True))
+                q = fb
+            else:
+                no_svg_data.append((qid, code, False))
+                continue
+        qs.append((code, qid, q))
+
+    print(f"\n{subj_name}: {len(qs)}/{len(rows)} SLT question(s) included in worksheet")
+    if no_svg_data:
+        print(f"  Question(s) without SVG data ({len(no_svg_data)}):")
+        for qid, code, has_fb in no_svg_data:
+            status = "fallback image available" if has_fb else "NO FALLBACK — skipped"
+            print(f"    {code} ({qid}) — {status}")
+
+    if not qs:
+        return
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ak_dir = out_dir / "_Answers"
+    ak_dir.mkdir(parents=True, exist_ok=True)
+
+    pdf_name = f"SLT {subj_abbr} unique questions.pdf"
+    ak_name  = f"SLT {subj_abbr} unique questions~Key.pdf"
+    subtitle = "SLT Uniques"
+
+    if not keys_only:
+        await render_worksheet(
+            page, "", "", qs, out_dir, font_dir,
+            page_title=page_title, page_subtitle=subtitle,
+            label_prefix="", pdf_filename=pdf_name, math_mode=math_mode,
+        )
+
+    explanations = load_explanations(expl_path)
+    if explanations:
+        labelled = [(code, qid, q) for code, qid, q in qs]
+        missing = await render_answer_key(
+            page, page_title, subtitle, labelled, explanations,
+            ak_dir, font_dir, ak_name,
+            sheet_answers=sheet_answers, math_mode=math_mode,
+        )
+        if missing:
+            print(f"  ⚠  Missing correct answer in JSON for {len(missing)} question(s):")
+            for s in sorted(missing):
+                print(f"       {s}")
+
+    print(f"  Saved: {out_dir / pdf_name}")
+    if explanations:
+        print(f"  Saved: {ak_dir / ak_name}")
+
+
+async def run_slt_worksheets(args, math_questions: dict, rw_questions: dict) -> None:
+    """Standalone entry point: build the 'SLT Uniques' worksheet + answer key
+    for both subjects. (The math/rw worksheet commands also build these as
+    part of their normal run — this command exists to regenerate just these
+    two worksheets on their own.)"""
+    master_rows = load_master_csv()
+
+    sheet_answers: dict[str, str] = {}
+    for row in master_rows:
+        qid = row.get("ID", "").strip()
+        ans = row.get("Answer", "").strip()
+        if qid and ans:
+            sheet_answers[qid] = ans
+
+    subjects = [
+        ("Math", math_questions, "math", Path(args.math_out),
+         "SAT Math", _MATH_EXPL, True),
+        ("Reading & Writing", rw_questions, "rw", Path(args.rw_out),
+         "SAT Reading & Writing", _RW_EXPL, False),
+    ]
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch()
+        context = await browser.new_context(viewport={"width": 1200, "height": 900})
+        page = await context.new_page()
+
+        for subj_name, bank, fallback_subj, out_dir, page_title, expl_path, math_mode in subjects:
+            await _render_slt_uniques(
+                page, subj_name, bank, fallback_subj, out_dir, page_title,
+                expl_path, math_mode, sheet_answers, master_rows, args.keys_only,
+            )
+
+        await browser.close()
+
+        await browser.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # RUN: PRACTICE TESTS
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1938,8 +2266,11 @@ def _test_display(test_key: str) -> str:
     return test_key.upper()
 
 
-def load_test_data() -> dict:
-    """
+def load_test_data(master_rows: list[dict]) -> dict:
+    """Build SAT4-11 and PSAT1-2 module question lists live from the master
+    spreadsheet's Skill code column (e.g. 'SAT9 M 2.14', 'PSAT1 RW 1.3') —
+    always current, no local JSON snapshot to go stale.
+
     Returns:
         {
           'SAT4': {'RW': {1: [qid, ...], 2: [...], 3: [...]}, 'M': {...}},
@@ -1947,60 +2278,31 @@ def load_test_data() -> dict:
           ...
         }
     """
-    result = {}
-
-    # SAT4–11 from practice-test-questions.json
-    pt_json_path = _PT_JSON if _PT_JSON.exists() else _REPO / _PT_JSON.name
-    with open(pt_json_path, encoding="utf-8") as f:
-        pt_json = json.load(f)
-
-    _pt_key_map = {"Reading & Writing": "RW", "Math": "M"}
-    for pt_label, data in pt_json.items():
-        m = re.match(r'Practice Test (\d+)', pt_label)
-        if not m:
-            continue
-        test_key = f"SAT{m.group(1)}"
-        if test_key not in _ALL_TESTS:
-            continue
-        result[test_key] = {}
-        for subj_label, modules in data.items():
-            subj = _pt_key_map.get(subj_label)
-            if subj is None:
-                continue
-            result[test_key][subj] = {
-                mod_num + 1: qids
-                for mod_num, qids in enumerate(modules)
-            }
-
-    # PSAT1–2 from master spreadsheet
-    print("Fetching master spreadsheet for PSAT data…")
-    resp = requests.get(QB_DATA_URL, timeout=30)
-    resp.raise_for_status()
-
-    psat_slots: dict = defaultdict(lambda: defaultdict(dict))
-    for row in csv.DictReader(io.StringIO(resp.text)):
+    slots: dict = defaultdict(lambda: defaultdict(dict))
+    for row in master_rows:
         code = row.get("Skill code", "").strip()
         qid  = row.get("ID", "").strip()
-        m = re.match(r'^(PSAT\d+)\s+(RW|M)\s+(\d+)\.(\d+)$', code, re.IGNORECASE)
+        m = re.match(r'^(SAT\d+|PSAT\d+)\s+(RW|M)\s+(\d+)\.(\d+)$', code, re.IGNORECASE)
         if not m:
             continue
         test_key = m.group(1).upper()
-        if test_key not in _PSAT_TESTS:
+        if test_key not in _ALL_TESTS:
             continue
         subj    = m.group(2).upper()
         mod_num = int(m.group(3))
         q_num   = int(m.group(4))
-        psat_slots[test_key][subj][(mod_num, q_num)] = qid
+        slots[test_key][subj][(mod_num, q_num)] = qid
 
-    for test_key, subj_data in psat_slots.items():
+    result = {}
+    for test_key, subj_data in slots.items():
         result[test_key] = {}
         for subj, slot_dict in subj_data.items():
             mods: dict = defaultdict(dict)
             for (mod_num, q_num), qid in slot_dict.items():
                 mods[mod_num][q_num] = qid
             result[test_key][subj] = {
-                mod_num: [slots[q] for q in sorted(slots)]
-                for mod_num, slots in sorted(mods.items())
+                mod_num: [slots_[q] for q in sorted(slots_)]
+                for mod_num, slots_ in sorted(mods.items())
             }
 
     return result
@@ -2015,18 +2317,29 @@ async def _render_module_pdf(
     questions: dict,
     out_dir: Path,
     font_dir: Path,
-) -> Path:
+    explanations: dict,
+    sheet_answers: dict,
+) -> tuple[Path, Path, list[tuple[str, str, bool]], list[str]]:
     test_display = _test_display(test_key)
     subj_display = "Reading & Writing" if subj == "RW" else "Math"
     subtitle     = f"{subj_display} · Module {mod_num}"
     filename     = f"{test_display} - {subj_display} Module {mod_num}.pdf"
     label_prefix = f"{test_key} {subj} {mod_num}"
+    fallback_subj = "rw" if subj == "RW" else "math"
 
     qs = []
+    no_svg_data: list[tuple[str, str, bool]] = []  # (qid, label, fallback_available)
     for q_num, qid in enumerate(qids, start=1):
         q = questions.get(qid)
         if q is None:
-            continue
+            label = f"{label_prefix}.{q_num}"
+            fb = _image_fallback_question(qid, fallback_subj)
+            if fb:
+                no_svg_data.append((qid, label, True))
+                q = fb
+            else:
+                no_svg_data.append((qid, label, False))
+                continue
         qs.append((q_num, qid, q))
 
     await render_worksheet(
@@ -2037,7 +2350,17 @@ async def _render_module_pdf(
         pdf_filename=filename,
         math_mode=(subj != "RW"),
     )
-    return out_dir / filename
+
+    ak_name = f"{test_display} - {subj_display} Module {mod_num}~Key.pdf"
+    labelled = [(f"{label_prefix}.{q_num}", qid, q) for q_num, qid, q in qs]
+    missing = await render_answer_key(
+        page, test_display, subtitle, labelled, explanations,
+        out_dir, font_dir, ak_name,
+        sheet_answers=sheet_answers,
+        math_mode=(subj != "RW"),
+    )
+
+    return out_dir / filename, out_dir / ak_name, no_svg_data, missing
 
 
 async def _practice_test_worker(
@@ -2048,6 +2371,10 @@ async def _practice_test_worker(
     out_dir: Path,
     font_dir: Path,
     progress: list,
+    no_svg_data_all: list,
+    missing_all: list,
+    explanations: dict,
+    sheet_answers: dict,
 ) -> None:
     ctx  = await browser.new_context(device_scale_factor=2)
     page = await ctx.new_page()
@@ -2056,17 +2383,23 @@ async def _practice_test_worker(
             test_display = _test_display(test_key)
             subj_data    = test_data.get(test_key, {})
             test_dir     = out_dir / test_key
-            test_dir.mkdir(parents=True, exist_ok=True)
+            modules_dir  = test_dir / "Modules"
+            modules_dir.mkdir(parents=True, exist_ok=True)
             module_pdfs  = []
+            module_keys  = []
 
             for subj, mod_num in _MODULE_ORDER:
                 qids = subj_data.get(subj, {}).get(mod_num)
                 if not qids:
                     continue
-                pdf_path = await _render_module_pdf(
-                    page, test_key, subj, mod_num, qids, questions, test_dir, font_dir
+                pdf_path, key_path, no_svg_data, missing = await _render_module_pdf(
+                    page, test_key, subj, mod_num, qids, questions, modules_dir, font_dir,
+                    explanations, sheet_answers,
                 )
                 module_pdfs.append(pdf_path)
+                module_keys.append(key_path)
+                no_svg_data_all.extend(no_svg_data)
+                missing_all.extend(missing)
 
             if module_pdfs:
                 writer = PdfWriter()
@@ -2075,6 +2408,15 @@ async def _practice_test_worker(
                     for pg in reader.pages:
                         writer.add_page(pg)
                 with open(test_dir / f"{test_key}.pdf", "wb") as f:
+                    writer.write(f)
+
+            if module_keys:
+                writer = PdfWriter()
+                for key_path in module_keys:
+                    reader = PdfReader(str(key_path))
+                    for pg in reader.pages:
+                        writer.add_page(pg)
+                with open(test_dir / f"{test_key}~Key.pdf", "wb") as f:
                     writer.write(f)
 
             progress.append(test_key)
@@ -2097,7 +2439,16 @@ async def run_practice_tests(args) -> None:
     questions = load_banks()
     print(f"  {len(questions)} questions loaded")
 
-    test_data = load_test_data()
+    master_rows = load_master_csv()
+    sheet_answers: dict[str, str] = {}   # qid → correct answer from spreadsheet
+    for row in master_rows:
+        qid = row.get("ID", "").strip()
+        ans = row.get("Answer", "").strip()
+        if qid and ans:
+            sheet_answers[qid] = ans
+    explanations = {**load_explanations(_MATH_EXPL), **load_explanations(_RW_EXPL)}
+
+    test_data = load_test_data(master_rows)
     available = [t for t in target_tests if t in test_data]
     missing   = [t for t in target_tests if t not in test_data]
     if missing:
@@ -2108,16 +2459,29 @@ async def run_practice_tests(args) -> None:
 
     font_dir = _FONT_DIR
     progress: list = []
+    no_svg_data_all: list = []
+    missing_all: list = []
 
     async with async_playwright() as p:
         browser = await p.chromium.launch()
         await asyncio.gather(*[
-            _practice_test_worker(browser, chunk, test_data, questions, out_dir, font_dir, progress)
+            _practice_test_worker(browser, chunk, test_data, questions, out_dir, font_dir,
+                                  progress, no_svg_data_all, missing_all,
+                                  explanations, sheet_answers)
             for chunk in _chunk(available, args.workers)
         ])
         await browser.close()
 
     print(f"\nDone! {len(progress)}/{total} tests saved to: {out_dir}/")
+    if no_svg_data_all:
+        print(f"  Question(s) without SVG data ({len(no_svg_data_all)}):")
+        for qid, label, has_fb in sorted(no_svg_data_all, key=lambda t: t[1]):
+            status = "fallback image available" if has_fb else "NO FALLBACK — skipped"
+            print(f"    {label} ({qid}) — {status}")
+    if missing_all:
+        print(f"  ⚠  Missing correct answer in JSON for {len(missing_all)} question(s):")
+        for s in sorted(missing_all):
+            print(f"       {s}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2169,6 +2533,17 @@ def main() -> None:
     p_pt.add_argument("--workers", type=int, default=4,
                       help="Parallel browser contexts (default: 4)")
 
+    # ── slt ─────────────────────────────────────────────────────────────────
+    p_slt = sub.add_parser(
+        "slt", help="Generate SLT Uniques worksheets (all SLT-coded questions, one per subject)"
+    )
+    p_slt.add_argument("--math-out", default=str(_REPO / "math-worksheets"),
+                       help="Math output directory (default: math-worksheets/)")
+    p_slt.add_argument("--rw-out",   default=str(_REPO / "rw-worksheets"),
+                       help="RW output directory (default: rw-worksheets/)")
+    p_slt.add_argument("--keys-only", action="store_true",
+                       help="Generate answer keys only (skip worksheet PDFs)")
+
     args = parser.parse_args()
 
     if args.command == "images":
@@ -2183,6 +2558,10 @@ def main() -> None:
         asyncio.run(run_rw_worksheets(args, questions))
     elif args.command == "practice-tests":
         asyncio.run(run_practice_tests(args))
+    elif args.command == "slt":
+        math_questions = load_math_bank()
+        rw_questions = load_rw_bank()
+        asyncio.run(run_slt_worksheets(args, math_questions, rw_questions))
 
 
 if __name__ == "__main__":
