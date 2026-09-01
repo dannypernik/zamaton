@@ -2,7 +2,12 @@
 """
 Scrape the College Board SAT Suite Educator Question Bank
 (https://satsuiteeducatorquestionbank.collegeboard.org/digital/results)
-into JSON shaped like math-question-bank-explanations.json.
+into a content/meta JSON pair per section (see CONTENT_FIELDS/META_FIELDS).
+
+Each section writes two files: a *content* file with just what's needed to
+serve and score a question during a practice test, and a *meta* file with the
+taxonomy and the explanation, neither of which is wanted until after a test is
+submitted. generate.py merges the pair back into one record per question.
 
 Reverse-engineered from the site's own JS bundle - it's a public,
 unauthenticated JSON API (qbank-api.collegeboard.org) with no login wall,
@@ -19,8 +24,8 @@ forms (e.g. decimal equivalents of a fraction) that the modern API would
 include. A warning is printed for any such item.
 
 Usage:
-  python3 scrape_question_bank.py --section math --out math-question-bank-explanations.json
-  python3 scrape_question_bank.py --section rw --out reading-question-bank-explanations.json
+  python3 scrape_question_bank.py --section math   # → math-question-bank-{content,meta}.json
+  python3 scrape_question_bank.py --section rw     # → reading-question-bank-{content,meta}.json
   python3 scrape_question_bank.py --section math --domains Algebra,"Advanced Math" --limit 20
   python3 scrape_question_bank.py --section math --ids ac472881,3f5a3602
   python3 scrape_question_bank.py --section math --ids-file wanted_ids.txt
@@ -279,6 +284,44 @@ def load_existing(path):
     return {}
 
 
+# ── Output split ──────────────────────────────────────────────────────────────
+# Each section is written as two files. CONTENT_FIELDS is everything needed to
+# put a question in front of a student and score it, so a practice test can be
+# served from that file alone; META_FIELDS is everything else — the taxonomy
+# used for browsing/reporting, plus the explanation, which is only wanted after
+# a test is submitted. Explanation is 24% of the math bytes and 46% of the RW
+# bytes, so keeping it out of the serving file is most of the win.
+# Moving a field between these two tuples is all it takes to redraw the line;
+# generate.py merges the pair back together and doesn't care where a field sits.
+CONTENT_FIELDS = ("type", "prompt", "question", "answers", "correct")
+META_FIELDS    = ("domain", "skill", "difficulty", "explanation")
+
+# --section is the API's own name for the section; the bank files have always
+# used "reading" rather than "rw", so keep the filenames the repo expects.
+SECTION_TO_BANK_PREFIX = {"rw": "reading", "math": "math"}
+
+
+def split_record(record):
+    """Partition one scraped record into its (content, meta) halves.
+
+    A field absent from the record is omitted rather than written as null, so
+    the two files stay a clean partition of whatever the API actually returned.
+    """
+    content = {k: record[k] for k in CONTENT_FIELDS if k in record}
+    meta    = {k: record[k] for k in META_FIELDS    if k in record}
+    return content, meta
+
+
+def write_split(results, content_path, meta_path):
+    """Write the {qid: record} map out as the content/meta file pair."""
+    content_out, meta_out = {}, {}
+    for qid, record in results.items():
+        content_out[qid], meta_out[qid] = split_record(record)
+    for path, data in ((content_path, content_out), (meta_path, meta_out)):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--assessment", default="sat", choices=sorted(ASSESSMENT_IDS), help="Assessment to scrape (default: sat)")
@@ -286,14 +329,26 @@ def main():
     parser.add_argument("--domains", default=None, help="Comma-separated domain names to restrict to (default: all domains in the section)")
     parser.add_argument("--ids", default=None, help="Comma-separated question IDs to scrape (the short hex IDs used as keys in the output JSON, e.g. ac472881). Skips everything else in the section.")
     parser.add_argument("--ids-file", default=None, help="Path to a file with one question ID per line (blank lines and #-comments ignored)")
-    parser.add_argument("--out", default=None, help="Output JSON path (default: <section>-question-bank-explanations.json)")
+    parser.add_argument("--out", default=None, help=f"Content JSON path — the practice-test serving file, holding {', '.join(CONTENT_FIELDS)} (default: <bank>-question-bank-content.json)")
+    parser.add_argument("--out-meta", default=None, help=f"Meta JSON path, holding {', '.join(META_FIELDS)} (default: alongside --out as <bank>-question-bank-meta.json)")
     parser.add_argument("--concurrency", type=int, default=8, help="Concurrent detail-fetch workers (default: 8)")
     parser.add_argument("--limit", type=int, default=None, help="Only scrape the first N questions (for testing)")
     parser.add_argument("--resume", action="store_true", help="Skip question IDs already present in --out")
     parser.add_argument("--checkpoint-every", type=int, default=50, help="Write output to disk every N completed questions (default: 50)")
     args = parser.parse_args()
 
-    out_path = args.out or f"{args.section}-question-bank-explanations.json"
+    bank = SECTION_TO_BANK_PREFIX[args.section]
+    content_path = args.out or f"{bank}-question-bank-content.json"
+    if args.out_meta:
+        meta_path = args.out_meta
+    elif args.out:
+        # Derive from --out so an explicit path still yields a matching pair:
+        # foo-content.json → foo-meta.json, otherwise foo.json → foo-meta.json.
+        stem, ext = os.path.splitext(args.out)
+        stem = stem[: -len("-content")] if stem.endswith("-content") else stem
+        meta_path = f"{stem}-meta{ext or '.json'}"
+    else:
+        meta_path = f"{bank}-question-bank-meta.json"
     requested_domains = [d.strip() for d in args.domains.split(",")] if args.domains else None
     requested_ids = load_requested_ids(args.ids, args.ids_file)
 
@@ -330,8 +385,14 @@ def main():
     if args.limit:
         question_list = question_list[: args.limit]
 
-    results = load_existing(out_path) if args.resume else {}
+    results = {}
     if args.resume:
+        # Recombine the pair so a resumed run rewrites both halves intact —
+        # reading only the content file would blank the meta of finished ids.
+        existing_content = load_existing(content_path)
+        existing_meta    = load_existing(meta_path)
+        for qid in existing_content.keys() | existing_meta.keys():
+            results[qid] = {**existing_content.get(qid, {}), **existing_meta.get(qid, {})}
         before = len(question_list)
         question_list = [m for m in question_list if m["questionId"] not in results]
         print(f"Resuming: {before - len(question_list)} already done, {len(question_list)} remaining.", file=sys.stderr)
@@ -359,13 +420,13 @@ def main():
             if completed % 25 == 0 or completed == total:
                 print(f"{completed}/{total}", file=sys.stderr)
             if completed % args.checkpoint_every == 0:
-                with open(out_path, "w", encoding="utf-8") as f:
-                    json.dump(results, f, ensure_ascii=False, indent=2)
+                write_split(results, content_path, meta_path)
 
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
+    write_split(results, content_path, meta_path)
 
-    print(f"Wrote {len(results)} questions to {out_path}", file=sys.stderr)
+    print(f"Wrote {len(results)} questions to {content_path} "
+          f"({', '.join(CONTENT_FIELDS)}) and {meta_path} "
+          f"({', '.join(META_FIELDS)})", file=sys.stderr)
 
 
 if __name__ == "__main__":

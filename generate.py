@@ -8,6 +8,9 @@ Usage
   python scripts/generate.py math            [--out DIR] [--skill "Linear functions"] [--workers N]
   python scripts/generate.py rw              [--out DIR] [--skill "Transitions"] [--workers N]
   python scripts/generate.py practice-tests  [--out DIR] [--tests SAT4,PSAT1] [--workers N]
+  python scripts/generate.py slt             [--math-out DIR] [--rw-out DIR]
+  python scripts/generate.py new-questions [--date 8/1/26]  [--math-out DIR] [--rw-out DIR]
+                                            # omit --date for one worksheet per date present
 
 Requirements
 ------------
@@ -25,6 +28,7 @@ import re
 import shutil
 import unicodedata
 from collections import defaultdict
+from datetime import date
 from pathlib import Path
 
 import requests
@@ -39,20 +43,45 @@ _REPO     = Path(__file__).resolve().parent
 _TP       = _REPO.parent / "tpa/score-estimator/questions"
 _FONT_DIR = Path.home() / "Library/Fonts"
 
+_PRACTICE_TEST_SECOND_OUT = Path.home() / "Projects/Open Path/_Tutoring/_Test Prep/SAT/_Practice tests"
+_SLT_FIRST_OUT            = _REPO / "practice-tests/SLT"
+_SLT_SECOND_OUT           = Path.home() / "Projects/Open Path/_Tutoring/_Test Prep/SAT/_Practice tests/SLT"
+
 _FIGURES   = _REPO / "question-images/figures"
+
+# Question banks come from scrape_question_bank.py as a content/meta pair per
+# section: content holds what a practice test needs to serve and score a
+# question (type/prompt/question/answers/correct), meta holds the taxonomy and
+# the explanation. Nothing here cares about that boundary — load_*_bank()
+# merges the pair back into one record per question — but PDFs need every
+# field, so both files have to be present.
+_MATH_CONTENT = _REPO / "math-question-bank-content.json"
+_MATH_META    = _REPO / "math-question-bank-meta.json"
+_RW_CONTENT   = _REPO / "reading-question-bank-content.json"
+_RW_META      = _REPO / "reading-question-bank-meta.json"
+
+# Pre-split single-file banks. Still read when the pair above is absent, so a
+# checkout that hasn't been re-scraped yet keeps working.
 _MATH_BANK = _REPO / "math-question-bank.json"
 _RW_BANK   = _REPO / "reading-question-bank.json"
 _MATH_EXPL = _REPO / "math-question-bank-explanations.json"
 _RW_EXPL   = _REPO / "reading-question-bank-explanations.json"
 
 MASTER_SS_ID = "1XoANqHEGfOCdO1QBVnbA3GH-z7-_FMYwoy7Ft4ojulE"
-QB_DATA_GID  = "64410753"
+QB_DATA_GID  = "187852995"   # "Question bank data" tab
 QB_DATA_URL  = (
     f"https://docs.google.com/spreadsheets/d/{MASTER_SS_ID}"
     f"/export?format=csv&gid={QB_DATA_GID}"
 )
 
 # Practice test roster
+# Questions where the master spreadsheet and JSON disagree but have been
+# investigated and left as-is (JSON value kept, SS value is the discrepancy).
+KNOWN_JSON_DISCREPANCIES = {
+    "d073983d": {"field": "skill",   "json": "Form, Structure, and Sense", "ss": "Boundaries"},
+    "8e528129": {"field": "correct", "json": "4",                          "ss": "4.44"},
+}
+
 _SAT_TESTS  = [f"SAT{n}" for n in range(4, 12)]   # SAT4 … SAT11
 _PSAT_TESTS = ["PSAT1", "PSAT2"]
 _ALL_TESTS  = _SAT_TESTS + _PSAT_TESTS
@@ -80,6 +109,48 @@ def _test_code_status(code: str) -> str | None:
     if prefix == "SAT" and num <= 3:
         return "published"
     return "live"
+
+
+# m/d/yy, mm/dd/yyyy, or anything between: 1-2 digit month/day, 2- or 4-digit
+# year, separated by /, -, or . (mixed separators like "8-1/26" also match —
+# not worth rejecting since the two sides are still unambiguous).
+_ADDED_DATE_RE = re.compile(r"^(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2}|\d{4})$")
+
+
+def _parse_added_date(raw: str) -> str:
+    """Parse a user-supplied date into the master sheet's own 'Date added'
+    format (zero-padded MM/DD/YYYY), so the caller can match it with a plain
+    string comparison — every value in that column is already this shape.
+
+    A 2-digit year is read as 20YY: every 'Date added' value in the sheet
+    falls in the 2020s, so there's no real ambiguity to resolve.
+    Used as an argparse `type=`, so a bad value raises ArgumentTypeError and
+    argparse reports it — no separate validation needed at the call site.
+    """
+    m = _ADDED_DATE_RE.match(raw.strip())
+    if not m:
+        raise argparse.ArgumentTypeError(
+            f"invalid date {raw!r} — expected m/d/yy, mm/dd/yyyy, or similar "
+            f"(1-2 digit month/day, 2- or 4-digit year, / - or . separators)"
+        )
+    month, day, year = m.groups()
+    if len(year) == 2:
+        year = f"20{year}"
+    try:
+        parsed = date(int(year), int(month), int(day))
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"invalid date {raw!r}: {e}") from e
+    return parsed.strftime("%m/%d/%Y")
+
+
+def _date_sort_key(mmddyyyy: str) -> date:
+    """Chronological sort key for an already-normalized MM/DD/YYYY string.
+
+    A plain string sort would order by month first ("02/…/2025" before
+    "10/…/2024"), which isn't chronological once the year varies.
+    """
+    m, d, y = mmddyyyy.split("/")
+    return date(int(y), int(m), int(d))
 
 
 # Base URL for question image fallbacks (used when an ID is not in the JSON bank)
@@ -655,6 +726,13 @@ body {{
   font-size: 10pt;
   color: #777777;
 }}
+.question-skill {{
+  font-family: 'Montserrat', sans-serif;
+  font-weight: 400;
+  font-size: 10pt;
+  color: #777777;
+  margin-left: 10pt;
+}}
 
 /* ── Content areas ────────────────────────────────── */
 .prompt-text {{
@@ -745,7 +823,9 @@ td, th {{
   text-align: center;
   vertical-align: middle;
   font-size: 9pt;
-  word-break: break-word;
+  word-break: normal;
+  overflow-wrap: break-word;
+  hyphens: none;
 }}
 th {{ background: #f0f0f0; font-weight: 600; }}
 
@@ -756,6 +836,13 @@ p[style*="text-align:center"] {{ text-align: center !important; }}
 p[style*="text-align: right"]  {{ text-align: right  !important; }}
 p[style*="text-align:right"]   {{ text-align: right  !important; }}
 p[style*="text-align: left"]   {{ text-align: left   !important; }}
+/* CollegeBoard/QTI standalone image blocks (e.g. tables rendered as PNG) */
+.standalone_image img {{
+  display: block;
+  width: 100%;
+  height: auto;
+  max-width: 100%;
+}}
 /* CollegeBoard/QTI class names that indicate a centred block equation */
 .standalone_statement,
 .para_center,
@@ -1020,11 +1107,15 @@ def build_worksheet_html(
             answers_section = '<div class="spr-answer-box"><div class="spr-answer-line"></div></div>'
             block_class = "question-spr"
 
+        skill_span = (
+            f'<span class="question-skill">{q["_skill_code"]}</span>'
+            if q.get("_skill_code") else ""
+        )
         blocks_html += f"""
       <div class="question-block {block_class}">
         <div class="question-header">
           <span class="question-number">{label}</span>
-          <span class="question-id">{q_id}</span>
+          <span class="question-id">{q_id}</span>{skill_span}
         </div>
         {prompt_section}
         {figure_section}
@@ -1061,6 +1152,12 @@ _DOM_FIXUPS = """() => {
         if (w && /^\d+(\.\d+)?px$/.test(w.trim()) && parseFloat(w) < 400) {
             t.style.removeProperty('width');
         }
+    });
+    // Strip fixed width/height attributes from standalone_image imgs so the
+    // CSS width:100% can scale them to fill the content column.
+    document.querySelectorAll('.standalone_image img').forEach(img => {
+        img.removeAttribute('width');
+        img.removeAttribute('height');
     });
     document.querySelectorAll('.answer-text figure.image svg').forEach(svg => {
         svg.removeAttribute('width');
@@ -1533,16 +1630,53 @@ def load_master_csv() -> list[dict]:
     return list(csv.DictReader(io.StringIO(resp.text)))
 
 
-def load_math_bank() -> dict:
-    p = _MATH_BANK if _MATH_BANK.exists() else _REPO / _MATH_BANK.name
-    with open(p, encoding="utf-8") as f:
+def _read_json(path: Path) -> dict:
+    with open(path, encoding="utf-8") as f:
         return json.load(f)
+
+
+def _load_bank(content: Path, meta: Path, legacy: Path, legacy_expl: Path) -> dict:
+    """Merge a content/meta bank pair into {qid: record} with every field.
+
+    Falls back to the pre-split single-file bank (plus its explanations file,
+    which carried the same fields as the bank and is what the meta half now
+    replaces) when the pair isn't there. A question present in only one half of
+    the pair still comes through — the missing fields are simply absent, and
+    every consumer here already treats them as optional.
+    """
+    if content.exists() or meta.exists():
+        if not content.exists() or not meta.exists():
+            missing = content if not content.exists() else meta
+            raise FileNotFoundError(
+                f"{missing.name} is missing — the bank is a content/meta pair. "
+                f"Re-run: python scrape_question_bank.py --section "
+                f"{'math' if 'math' in content.name else 'rw'}"
+            )
+        content_data, meta_data = _read_json(content), _read_json(meta)
+        return {
+            qid: {**content_data.get(qid, {}), **meta_data.get(qid, {})}
+            for qid in content_data.keys() | meta_data.keys()
+        }
+
+    if not legacy.exists():
+        raise FileNotFoundError(
+            f"No question bank found — expected {content.name} + {meta.name}, "
+            f"or the pre-split {legacy.name}."
+        )
+    bank = _read_json(legacy)
+    if legacy_expl.exists():
+        for qid, rec in _read_json(legacy_expl).items():
+            if "explanation" in rec:
+                bank.setdefault(qid, {}).setdefault("explanation", rec["explanation"])
+    return bank
+
+
+def load_math_bank() -> dict:
+    return _load_bank(_MATH_CONTENT, _MATH_META, _MATH_BANK, _MATH_EXPL)
 
 
 def load_rw_bank() -> dict:
-    p = _RW_BANK if _RW_BANK.exists() else _REPO / _RW_BANK.name
-    with open(p, encoding="utf-8") as f:
-        return json.load(f)
+    return _load_bank(_RW_CONTENT, _RW_META, _RW_BANK, _RW_EXPL)
 
 
 def load_banks() -> dict:
@@ -1553,12 +1687,23 @@ def load_banks() -> dict:
     return banks
 
 
-def load_explanations(path: Path) -> dict:
-    """Load an explanations JSON (math or RW).  Returns {} if file is missing."""
-    if not path.exists():
-        return {}
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
+def load_explanations(subject: str, bank: dict | None = None) -> dict:
+    """Records carrying explanation text for one subject, keyed by question id.
+
+    In the split format the explanation rides along in the meta half, so the
+    merged *bank* already is the explanations map — pass the one the caller
+    holds rather than re-parsing tens of MB. Pre-split checkouts fall back to
+    the standalone explanations file; {} if that's missing too.
+    """
+    content, meta, legacy = (
+        (_MATH_CONTENT, _MATH_META, _MATH_EXPL) if subject == "math"
+        else (_RW_CONTENT, _RW_META, _RW_EXPL)
+    )
+    if content.exists() or meta.exists():
+        if bank is None:
+            bank = load_math_bank() if subject == "math" else load_rw_bank()
+        return bank
+    return _read_json(legacy) if legacy.exists() else {}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1780,23 +1925,33 @@ async def run_math_worksheets(args, all_questions: dict, regen_ids: set | None =
         if q_num not in slot_map[(skill_d, diff_n)]:
             slot_map[(skill_d, diff_n)][q_num] = qid
 
-    tombstone_ids = {   # qid → True if SLT-coded, False if SAT/PSAT-coded
-        qid: live_test_ids[qid]
+    tombstone_ids: dict[str, str] = {   # qid → tombstone note
+        qid: (
+            "Appears on a linear practice test. See SLT M Uniques worksheet."
+            if live_test_ids[qid] else
+            "Removed. Appears on a practice test."
+        )
         for slots in slot_map.values()
         for qid in slots.values()
         if qid in live_test_ids
     }
+    # Tombstone base IDs whose difficulty changed (a +/- variant exists in slot_map)
+    for (skill_d, diff_n), slots in slot_map.items():
+        for q_num, qid in slots.items():
+            if qid.endswith(("+", "-")) and qid[:-1] not in tombstone_ids:
+                tombstone_ids[qid[:-1]] = f"Difficulty changed. See {skill_d} {diff_n}.{q_num}."
     worksheet_ids = {
         qid for slots in slot_map.values() for qid in slots.values()
         if qid not in tombstone_ids
     }
     print(f"  {len(worksheet_ids)} worksheet questions  |  {len(tombstone_ids)} tombstone(s)")
-    if tombstone_ids:
-        for (skill_d, diff_n), slots in sorted(slot_map.items()):
-            ts = [(n, qid) for n, qid in sorted(slots.items()) if qid in tombstone_ids]
-            if ts:
-                print(f"  Tombstones in {skill_d} {diff_n}: "
-                      + ", ".join(f"{n}={qid}" for n, qid in ts))
+    tombstone_by_reason: dict[str, list[str]] = defaultdict(list)
+    for slots in slot_map.values():
+        for qid in slots.values():
+            if qid in tombstone_ids:
+                note = tombstone_ids[qid]
+                label = "Difficulty changed" if note.startswith("Difficulty changed") else note
+                tombstone_by_reason[label].append(qid)
 
     # Validate consecutive q_nums
     for (skill_d, diff_n), slots in slot_map.items():
@@ -1825,20 +1980,16 @@ async def run_math_worksheets(args, all_questions: dict, regen_ids: set | None =
         for q_num in sorted(slots.keys()):
             qid = slots[q_num]
             if qid in tombstone_ids:
-                note = (
-                    "Appears on a linear practice test. See SLT M Uniques worksheet."
-                    if tombstone_ids[qid] else
-                    "Removed. Appears on a practice test."
-                )
                 qs.append((q_num, qid, {
                     "_tombstone": True,
                     "correct": sheet_answers.get(qid, ""),
-                    "_tombstone_note": note,
+                    "_tombstone_note": tombstone_ids[qid],
                 }))
             else:
-                q = all_questions.get(qid)
+                base_id = qid[:-1] if qid.endswith(("+", "-")) else qid
+                q = all_questions.get(qid) or all_questions.get(base_id)
                 if q is None:
-                    q = _image_fallback_question(qid, "math")
+                    q = _image_fallback_question(qid, "math") or _image_fallback_question(base_id, "math")
                     if q:
                         fallback_used.append(f"{skill_d} {diff_n}.{q_num} ({qid})")
                     else:
@@ -1872,7 +2023,7 @@ async def run_math_worksheets(args, all_questions: dict, regen_ids: set | None =
     ak_dir       = out_dir / "_Answers"
     ak_dir.mkdir(parents=True, exist_ok=True)
     font_dir     = _FONT_DIR
-    explanations = load_explanations(_MATH_EXPL)
+    explanations = load_explanations("math", all_questions)
     progress:    list = []
     missing_all: list = []
 
@@ -1913,12 +2064,17 @@ async def run_math_worksheets(args, all_questions: dict, regen_ids: set | None =
             slt_page = await context.new_page()
             await _render_slt_uniques(
                 slt_page, "Math", all_questions, "math", out_dir, "SAT Math",
-                _MATH_EXPL, True, sheet_answers, master_rows, args.keys_only,
+                True, sheet_answers, master_rows, args.keys_only,
             )
 
         await browser.close()
 
     print(f"\nDone! {len(progress)}/{total} worksheets saved to: {out_dir}/")
+    if tombstone_by_reason:
+        for reason, ids in sorted(tombstone_by_reason.items()):
+            print(f"\n  {reason}")
+            for qid in sorted(ids):
+                print(f"    {qid}")
     if missing_all:
         print(f"  ⚠  Missing correct answer in JSON for {len(missing_all)} question(s):")
         for s in sorted(missing_all):
@@ -1964,23 +2120,33 @@ async def run_rw_worksheets(args, rw_questions: dict, regen_ids: set | None = No
         q_num   = int(m.group(3))
         slot_map[(skill_c, diff_n)][q_num] = qid
 
-    tombstone_ids = {   # qid → True if SLT-sourced, False if SAT/PSAT-sourced
-        qid: live_src_ids[qid]
+    tombstone_ids: dict[str, str] = {   # qid → tombstone note
+        qid: (
+            "Appears on a linear practice test. See SLT RW Uniques worksheet."
+            if live_src_ids[qid] else
+            "Removed. Appears on a practice test."
+        )
         for slots in slot_map.values()
         for qid in slots.values()
         if qid in live_src_ids
     }
+    # Tombstone base IDs whose difficulty changed (a +/- variant exists in slot_map)
+    for (skill_c, diff_n), slots in slot_map.items():
+        for q_num, qid in slots.items():
+            if qid.endswith(("+", "-")) and qid[:-1] not in tombstone_ids:
+                tombstone_ids[qid[:-1]] = f"Difficulty changed. See {skill_c} {diff_n}.{q_num}."
     worksheet_ids = {
         qid for slots in slot_map.values() for qid in slots.values()
         if qid not in tombstone_ids
     }
     print(f"  {len(worksheet_ids)} worksheet questions  |  {len(tombstone_ids)} tombstone(s)")
-    if tombstone_ids:
-        for (skill_c, diff_n), slots in sorted(slot_map.items()):
-            ts = [(n, qid) for n, qid in sorted(slots.items()) if qid in tombstone_ids]
-            if ts:
-                print(f"  Tombstones in {skill_c} {diff_n}: "
-                      + ", ".join(f"{n}={qid}" for n, qid in ts))
+    tombstone_by_reason: dict[str, list[str]] = defaultdict(list)
+    for slots in slot_map.values():
+        for qid in slots.values():
+            if qid in tombstone_ids:
+                note = tombstone_ids[qid]
+                label = "Difficulty changed" if note.startswith("Difficulty changed") else note
+                tombstone_by_reason[label].append(qid)
 
     # Append new IDs (in bank but not in master)
     new_assignments = []
@@ -2004,20 +2170,16 @@ async def run_rw_worksheets(args, rw_questions: dict, regen_ids: set | None = No
         for q_num in sorted(slots.keys()):
             qid = slots[q_num]
             if qid in tombstone_ids:
-                note = (
-                    "Appears on a linear practice test. See SLT RW Uniques worksheet."
-                    if tombstone_ids[qid] else
-                    "Removed. Appears on a practice test."
-                )
                 qs.append((q_num, qid, {
                     "_tombstone": True,
                     "correct": sheet_answers.get(qid, ""),
-                    "_tombstone_note": note,
+                    "_tombstone_note": tombstone_ids[qid],
                 }))
             else:
-                q = rw_questions.get(qid)
+                base_id = qid[:-1] if qid.endswith(("+", "-")) else qid
+                q = rw_questions.get(qid) or rw_questions.get(base_id)
                 if q is None:
-                    q = _image_fallback_question(qid, "rw")
+                    q = _image_fallback_question(qid, "rw") or _image_fallback_question(base_id, "rw")
                     if q:
                         fallback_used.append(f"{skill} {diff_n}.{q_num} ({qid})")
                     else:
@@ -2051,7 +2213,7 @@ async def run_rw_worksheets(args, rw_questions: dict, regen_ids: set | None = No
     ak_dir       = out_dir / "_Answers"
     ak_dir.mkdir(parents=True, exist_ok=True)
     font_dir     = _FONT_DIR
-    explanations = load_explanations(_RW_EXPL)
+    explanations = load_explanations("rw", rw_questions)
     progress:    list = []
     missing_all: list = []
 
@@ -2102,7 +2264,7 @@ async def run_rw_worksheets(args, rw_questions: dict, regen_ids: set | None = No
             slt_page = await context.new_page()
             await _render_slt_uniques(
                 slt_page, "Reading & Writing", rw_questions, "rw", out_dir,
-                "SAT Reading & Writing", _RW_EXPL, False, sheet_answers,
+                "SAT Reading & Writing", False, sheet_answers,
                 master_rows, args.keys_only,
             )
 
@@ -2117,6 +2279,11 @@ async def run_rw_worksheets(args, rw_questions: dict, regen_ids: set | None = No
             w.writerow([qid, sk, di, qn, code])
 
     print(f"\nDone! {len(progress)}/{total} worksheets saved to: {out_dir}/")
+    if tombstone_by_reason:
+        for reason, ids in sorted(tombstone_by_reason.items()):
+            print(f"\n  {reason}")
+            for qid in sorted(ids):
+                print(f"    {qid}")
     if new_assignments:
         print(f"{len(new_assignments)} new IDs assigned → {new_csv}")
     if missing_all:
@@ -2136,7 +2303,6 @@ async def _render_slt_uniques(
     fallback_subj: str,    # "math" or "rw"
     out_dir: Path,
     page_title: str,
-    expl_path: Path,
     math_mode: bool,
     sheet_answers: dict,
     master_rows: list,
@@ -2203,7 +2369,7 @@ async def _render_slt_uniques(
             label_prefix="", pdf_filename=pdf_name, math_mode=math_mode,
         )
 
-    explanations = load_explanations(expl_path)
+    explanations = load_explanations(fallback_subj, bank)
     if explanations:
         labelled = [(code, qid, q) for code, qid, q in qs]
         missing = await render_answer_key(
@@ -2219,6 +2385,15 @@ async def _render_slt_uniques(
     print(f"  Saved: {out_dir / pdf_name}")
     if explanations:
         print(f"  Saved: {ak_dir / ak_name}")
+
+    for copy_dest in (_SLT_FIRST_OUT, _SLT_SECOND_OUT):
+        copy_dest.mkdir(parents=True, exist_ok=True)
+        if not keys_only and (out_dir / pdf_name).exists():
+            shutil.copy2(out_dir / pdf_name, copy_dest / pdf_name)
+            print(f"  Copied: {copy_dest / pdf_name}")
+        if explanations and (ak_dir / ak_name).exists():
+            shutil.copy2(ak_dir / ak_name, copy_dest / ak_name)
+            print(f"  Copied: {copy_dest / ak_name}")
 
 
 async def run_slt_worksheets(args, math_questions: dict, rw_questions: dict) -> None:
@@ -2237,9 +2412,9 @@ async def run_slt_worksheets(args, math_questions: dict, rw_questions: dict) -> 
 
     subjects = [
         ("Math", math_questions, "math", Path(args.math_out),
-         "SAT Math", _MATH_EXPL, True),
+         "SAT Math", True),
         ("Reading & Writing", rw_questions, "rw", Path(args.rw_out),
-         "SAT Reading & Writing", _RW_EXPL, False),
+         "SAT Reading & Writing", False),
     ]
 
     async with async_playwright() as p:
@@ -2247,13 +2422,206 @@ async def run_slt_worksheets(args, math_questions: dict, rw_questions: dict) -> 
         context = await browser.new_context(viewport={"width": 1200, "height": 900})
         page = await context.new_page()
 
-        for subj_name, bank, fallback_subj, out_dir, page_title, expl_path, math_mode in subjects:
+        for subj_name, bank, fallback_subj, out_dir, page_title, math_mode in subjects:
             await _render_slt_uniques(
                 page, subj_name, bank, fallback_subj, out_dir, page_title,
-                expl_path, math_mode, sheet_answers, master_rows, args.keys_only,
+                math_mode, sheet_answers, master_rows, args.keys_only,
             )
 
         await browser.close()
+
+
+async def _render_added_date_worksheet(
+    page,
+    subj_name: str,        # "Math" or "Reading & Writing"
+    bank: dict,
+    fallback_subj: str,    # "math" or "rw"
+    out_dir: Path,
+    page_title: str,
+    math_mode: bool,
+    sheet_answers: dict,
+    master_rows: list,
+    live_test_ids: set,     # qids with a SAT4+/PSAT#/SLT# row anywhere in the sheet
+    added_date: str,       # normalized MM/DD/YYYY, from _parse_added_date
+    keys_only: bool,
+) -> None:
+    """Build a combined worksheet + answer key of every non-practice-test
+    question added on *added_date*, for one subject — a proof sheet for a
+    freshly-added batch, not a student-facing worksheet.
+
+    A row only being non-practice-test *itself* isn't enough: the same
+    question id can carry a second row elsewhere in the sheet coding it onto
+    a live (unreleased) test, and that must exclude it here too — same rule
+    run_math_worksheets/run_rw_worksheets enforce via tombstoning. This just
+    drops the row outright rather than tombstoning, since there's no slot
+    numbering to keep contiguous on this ad-hoc sheet, unlike a concept
+    worksheet. Published SAT1-3 companions are left in — those are already
+    policy-safe to show on concept worksheets, so allowed here too.
+
+    Rows are grouped and ordered by skill/difficulty/question number, same as
+    the normal concept worksheets, but labelled with the full skill code
+    (e.g. "Area and Volume 1.27") since several skills can land in one sheet.
+    """
+    font_dir = _FONT_DIR
+    candidates = [
+        r for r in master_rows
+        if r.get("Subject", "").strip() == subj_name
+        and r.get("Date added", "").strip() == added_date
+        and _test_code_status(r.get("Skill code", "").strip()) is None
+    ]
+    rows          = [r for r in candidates if r.get("ID", "").strip() not in live_test_ids]
+    excluded_live = [r for r in candidates if r.get("ID", "").strip() in live_test_ids]
+
+    def sort_key(row):
+        m = re.match(r"^(.+?)\s+(\d+)\.(\d+)$", row.get("Skill code", "").strip())
+        return (m.group(1), int(m.group(2)), int(m.group(3))) if m else ("", 0, 0)
+    rows.sort(key=sort_key)
+
+    if excluded_live:
+        print(f"  {subj_name} {added_date}: excluding {len(excluded_live)} question(s) "
+              f"also coded onto a live/unreleased test:")
+        for r in sorted(excluded_live, key=sort_key):
+            print(f"    {r.get('Skill code','').strip()} ({r.get('ID','').strip()})")
+
+    if not rows:
+        return
+
+    qs: list = []
+    no_svg_data: list[tuple[str, str, bool]] = []  # (qid, skill_code, fallback_available)
+    for row in rows:
+        qid  = row.get("ID", "").strip()
+        code = row.get("Skill code", "").strip()
+        q = bank.get(qid)
+        if q is None:
+            fb = _image_fallback_question(qid, fallback_subj)
+            if fb:
+                no_svg_data.append((qid, code, True))
+                q = fb
+            else:
+                no_svg_data.append((qid, code, False))
+                continue
+        qs.append((code, qid, q))
+
+    print(f"\n{subj_name}: {len(qs)}/{len(rows)} question(s) added {added_date} included in worksheet")
+    if no_svg_data:
+        print(f"  Question(s) without SVG data ({len(no_svg_data)}):")
+        for qid, code, has_fb in no_svg_data:
+            status = "fallback image available" if has_fb else "NO FALLBACK — skipped"
+            print(f"    {code} ({qid}) — {status}")
+
+    if not qs:
+        return
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ak_dir = out_dir
+
+    # yyyy.mm.dd (not the sheet's own mm/dd/yyyy) so a plain directory listing
+    # sorts chronologically — mm.dd.yyyy sorts by month first, which puts
+    # "08...2025" before "09...2023" alphabetically despite being later.
+    mm, dd, yyyy = added_date.split("/")
+    date_slug = f"{yyyy}.{mm}.{dd}"
+    subj_abbr = "M" if subj_name == "Math" else "RW"
+    pdf_name  = f"{date_slug} New questions {subj_abbr}.pdf"
+    ak_name   = f"{date_slug} New questions {subj_abbr}~Key.pdf"
+    subtitle  = f"New Questions · Added {added_date}"
+
+    if not keys_only:
+        await render_worksheet(
+            page, "", "", qs, out_dir, font_dir,
+            page_title=page_title, page_subtitle=subtitle,
+            label_prefix="", pdf_filename=pdf_name, math_mode=math_mode,
+        )
+
+    explanations = load_explanations(fallback_subj, bank)
+    if explanations:
+        labelled = [(code, qid, q) for code, qid, q in qs]
+        missing = await render_answer_key(
+            page, page_title, subtitle, labelled, explanations,
+            ak_dir, font_dir, ak_name,
+            sheet_answers=sheet_answers, math_mode=math_mode,
+        )
+        if missing:
+            print(f"  ⚠  Missing correct answer in JSON for {len(missing)} question(s):")
+            for s in sorted(missing):
+                print(f"       {s}")
+
+    print(f"  Saved: {out_dir / pdf_name}")
+    if explanations:
+        print(f"  Saved: {ak_dir / ak_name}")
+
+
+async def run_added_date_worksheets(args, math_questions: dict, rw_questions: dict) -> None:
+    """Standalone entry point: build the 'New questions' worksheet + answer
+    key for both subjects, covering every non-practice-test question added
+    on args.date (already normalized by _parse_added_date). If args.date is
+    None, do this once per distinct 'Date added' value found among
+    non-practice-test rows, oldest first — optionally restricted to dates
+    on/after args.since, to skip old bulk-import batches."""
+    master_rows = load_master_csv()
+
+    sheet_answers: dict[str, str] = {}
+    for row in master_rows:
+        qid = row.get("ID", "").strip()
+        ans = row.get("Answer", "").strip()
+        if qid and ans:
+            sheet_answers[qid] = ans
+
+    # A question can carry a second row elsewhere in the sheet coding it onto
+    # a live (unreleased) test — that must exclude it here even though the
+    # row we're looking at is itself a plain concept code. Built across ALL
+    # rows regardless of subject, since a math qid's live-test row could in
+    # principle sit under either subject's rows.
+    live_test_ids = {
+        row.get("ID", "").strip()
+        for row in master_rows
+        if _test_code_status(row.get("Skill code", "").strip()) == "live"
+    }
+
+    subjects = [
+        ("Math", math_questions, "math", Path(args.math_out),
+         "SAT Math", True),
+        ("Reading & Writing", rw_questions, "rw", Path(args.rw_out),
+         "SAT Reading & Writing", False),
+    ]
+
+    if args.date:
+        target_dates = [args.date]
+    else:
+        subject_names = {s[0] for s in subjects}
+        found = {
+            row.get("Date added", "").strip()
+            for row in master_rows
+            if row.get("Subject", "").strip() in subject_names
+            and row.get("Date added", "").strip()
+            and _test_code_status(row.get("Skill code", "").strip()) is None
+            and row.get("ID", "").strip() not in live_test_ids
+        }
+        target_dates = sorted(found, key=_date_sort_key)
+        if args.since:
+            since_key = _date_sort_key(args.since)
+            skipped = [d for d in target_dates if _date_sort_key(d) < since_key]
+            target_dates = [d for d in target_dates if _date_sort_key(d) >= since_key]
+            if skipped:
+                print(f"  --since {args.since}: skipping {len(skipped)} earlier "
+                      f"date(s) ({', '.join(skipped)})")
+        print(f"No --date given — {len(target_dates)} distinct date(s) found "
+              f"with non-practice-test questions; generating one worksheet "
+              f"pair per date, oldest first.")
+        if not target_dates:
+            return
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch()
+        context = await browser.new_context(viewport={"width": 1200, "height": 900})
+        page = await context.new_page()
+
+        for added_date in target_dates:
+            for subj_name, bank, fallback_subj, out_dir, page_title, math_mode in subjects:
+                await _render_added_date_worksheet(
+                    page, subj_name, bank, fallback_subj, out_dir, page_title,
+                    math_mode, sheet_answers, master_rows, live_test_ids,
+                    added_date, args.keys_only,
+                )
 
         await browser.close()
 
@@ -2419,6 +2787,18 @@ async def _practice_test_worker(
                 with open(test_dir / f"{test_key}~Key.pdf", "wb") as f:
                     writer.write(f)
 
+            second_dir = _PRACTICE_TEST_SECOND_OUT / test_key
+            second_dir.mkdir(parents=True, exist_ok=True)
+            for fname in (f"{test_key}.pdf", f"{test_key}~Key.pdf"):
+                src = test_dir / fname
+                if src.exists():
+                    shutil.copy2(src, second_dir / fname)
+            second_modules_dir = second_dir / "Modules"
+            second_modules_dir.mkdir(parents=True, exist_ok=True)
+            for f in modules_dir.iterdir():
+                if f.is_file():
+                    shutil.copy2(f, second_modules_dir / f.name)
+
             progress.append(test_key)
             print(f"  [{len(progress)}] {test_display} — {len(module_pdfs)} modules")
     finally:
@@ -2446,7 +2826,7 @@ async def run_practice_tests(args) -> None:
         ans = row.get("Answer", "").strip()
         if qid and ans:
             sheet_answers[qid] = ans
-    explanations = {**load_explanations(_MATH_EXPL), **load_explanations(_RW_EXPL)}
+    explanations = {**load_explanations("math"), **load_explanations("rw")}
 
     test_data = load_test_data(master_rows)
     available = [t for t in target_tests if t in test_data]
@@ -2482,6 +2862,97 @@ async def run_practice_tests(args) -> None:
         print(f"  ⚠  Missing correct answer in JSON for {len(missing_all)} question(s):")
         for s in sorted(missing_all):
             print(f"       {s}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RUN: ALL QUESTIONS (combined reference PDFs)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def run_all_worksheets(args, math_questions: dict, rw_questions: dict) -> None:
+    """Generate one worksheet + one answer key per subject covering every question
+    (including practice test questions), ordered as they appear in the master
+    spreadsheet. Each question header shows its skill code next to the ID."""
+    master_rows = load_master_csv()
+    font_dir = _FONT_DIR
+
+    sheet_answers: dict[str, str] = {}
+    for row in master_rows:
+        qid = row.get("ID", "").strip()
+        ans = row.get("Answer", "").strip()
+        if qid and ans:
+            sheet_answers[qid] = ans
+
+    subjects = [
+        ("Math",             math_questions, "math", Path(args.math_out), "SAT Math",             True),
+        ("Reading & Writing", rw_questions,  "rw",   Path(args.rw_out),  "SAT Reading & Writing", False),
+    ]
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch()
+        context = await browser.new_context(viewport={"width": 1200, "height": 900})
+        page = await context.new_page()
+
+        for subj_name, bank, fallback_subj, out_dir, page_title, math_mode in subjects:
+            # Iterate master rows in order; first occurrence of each qid wins.
+            seen: set = set()
+            q_num_counter = 0
+            qs: list = []
+
+            for row in master_rows:
+                if row.get("Subject", "").strip() != subj_name:
+                    continue
+                qid  = row.get("ID", "").strip()
+                code = row.get("Skill code", "").strip()
+                if not qid or qid in seen:
+                    continue
+                seen.add(qid)
+
+                base_id = qid[:-1] if qid.endswith(("+", "-")) else qid
+                q = bank.get(qid) or bank.get(base_id)
+                if q is None:
+                    q = (_image_fallback_question(qid, fallback_subj) or
+                         _image_fallback_question(base_id, fallback_subj))
+                if q is None:
+                    continue
+
+                q_num_counter += 1
+                q = {**q, "_skill_code": code}
+                qs.append((q_num_counter, qid, q))
+
+            if not qs:
+                print(f"\n{subj_name}: no questions found — skipping.")
+                continue
+
+            out_dir.mkdir(parents=True, exist_ok=True)
+            ak_dir = out_dir / "_Answers"
+            ak_dir.mkdir(parents=True, exist_ok=True)
+
+            ws_name = f"All {subj_name} Questions.pdf"
+            ak_name = f"All {subj_name} Questions~Key.pdf"
+            print(f"\n{subj_name}: rendering {len(qs)} questions…")
+
+            if not args.keys_only:
+                await render_worksheet(
+                    page, "", "", qs, out_dir, font_dir,
+                    page_title=page_title, page_subtitle="All Questions",
+                    label_prefix="", pdf_filename=ws_name, math_mode=math_mode,
+                )
+                print(f"  Saved: {out_dir / ws_name}")
+
+            explanations = load_explanations(fallback_subj, bank)
+            if explanations:
+                missing = await render_answer_key(
+                    page, page_title, "All Questions", qs, explanations,
+                    ak_dir, font_dir, ak_name,
+                    sheet_answers=sheet_answers, math_mode=math_mode,
+                )
+                print(f"  Saved: {ak_dir / ak_name}")
+                if missing:
+                    print(f"  ⚠  Missing correct answer for {len(missing)} question(s):")
+                    for s in sorted(missing):
+                        print(f"       {s}")
+
+        await browser.close()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2544,6 +3015,42 @@ def main() -> None:
     p_slt.add_argument("--keys-only", action="store_true",
                        help="Generate answer keys only (skip worksheet PDFs)")
 
+    # ── new-questions ───────────────────────────────────────────────────────
+    p_new = sub.add_parser(
+        "new-questions",
+        help="Generate a worksheet of all non-practice-test questions added on a given date "
+             "(or one worksheet per date present, if --date is omitted)",
+    )
+    p_new_date = p_new.add_mutually_exclusive_group()
+    p_new_date.add_argument("--date", type=_parse_added_date,
+                       help="Date to match against the master sheet's 'Date added' column. "
+                            "Accepts m/d/yy, mm/dd/yyyy, or anything in between "
+                            "(1-2 digit month/day, 2- or 4-digit year, / - or . separators), "
+                            "e.g. 8/1/26, 08-01-2026, 8.1.26. Omit to generate one worksheet "
+                            "per distinct date present in the sheet.")
+    p_new_date.add_argument("--since", type=_parse_added_date,
+                       help="With no --date: only include dates on/after this cutoff "
+                            "(same formats as --date). Use to skip an old bulk-import "
+                            "date, e.g. --since 10/1/24.")
+    p_new.add_argument("--math-out", default=str(_REPO / "date-added"),
+                       help="Math output directory (default: date-added/)")
+    p_new.add_argument("--rw-out",   default=str(_REPO / "date-added"),
+                       help="RW output directory (default: date-added/)")
+    p_new.add_argument("--keys-only", action="store_true",
+                       help="Generate answer keys only (skip worksheet PDFs)")
+
+    # ── all ─────────────────────────────────────────────────────────────────
+    p_all = sub.add_parser(
+        "all",
+        help="Generate combined PDFs of all questions (one worksheet + one key per subject)",
+    )
+    p_all.add_argument("--math-out", default=str(_REPO / "math-worksheets/_All"),
+                       help="Math output directory (default: math-worksheets/_All/)")
+    p_all.add_argument("--rw-out",   default=str(_REPO / "rw-worksheets/_All"),
+                       help="RW output directory (default: rw-worksheets/_All/)")
+    p_all.add_argument("--keys-only", action="store_true",
+                       help="Generate answer keys only (skip worksheet PDFs)")
+
     args = parser.parse_args()
 
     if args.command == "images":
@@ -2562,6 +3069,14 @@ def main() -> None:
         math_questions = load_math_bank()
         rw_questions = load_rw_bank()
         asyncio.run(run_slt_worksheets(args, math_questions, rw_questions))
+    elif args.command == "new-questions":
+        math_questions = load_math_bank()
+        rw_questions = load_rw_bank()
+        asyncio.run(run_added_date_worksheets(args, math_questions, rw_questions))
+    elif args.command == "all":
+        math_questions = load_math_bank()
+        rw_questions = load_rw_bank()
+        asyncio.run(run_all_worksheets(args, math_questions, rw_questions))
 
 
 if __name__ == "__main__":
