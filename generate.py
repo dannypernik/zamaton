@@ -75,6 +75,14 @@ QB_DATA_URL  = (
 )
 
 # Practice test roster
+# Duplicate question IDs removed from the master spreadsheet.
+# Maps removed_id → canonical_id kept in the SS.
+DUPLICATE_IDS: dict[str, str] = {
+    "99c5e794": "c048055c",
+    "f8ff3249": "d8539e09",
+    "d3f7c429": "dd3a910a",
+}
+
 # Questions where the master spreadsheet and JSON disagree but have been
 # investigated and left as-is (JSON value kept, SS value is the discrepancy).
 KNOWN_JSON_DISCREPANCIES = {
@@ -641,7 +649,7 @@ def prep_html(html: str, math_mode: bool = True) -> str:
 # WORKSHEET / PRACTICE-TEST: CSS + HTML
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _worksheet_css(font_dir: Path, page_bottom_margin_in: float = 0.65) -> str:
+def _worksheet_css(font_dir: Path, page_bottom_margin_in: float = 0.65, mcq_margin_pt: int = 33) -> str:
     fd = str(font_dir).replace("\\", "/")
     return f"""
 @font-face {{
@@ -914,7 +922,7 @@ msubsup > mfrac:nth-child(3) {{ padding-bottom: 0.5em; }}
 
 /* ── MCQ: extra space below question block for scratch work ── */
 .question-block.question-mcq {{
-  margin-bottom: 33pt;
+  margin-bottom: {mcq_margin_pt}pt;
 }}
 
 /* ── SPR: more space below + answer box ──────────────── */
@@ -1045,7 +1053,8 @@ def build_worksheet_html(
     # Math worksheets compute their own bottom margin per-question (see
     # _BALANCE_SCRATCH_SPACE) — a nonzero @page bottom margin would stack on
     # top of that and double-count blank space at the bottom of the page.
-    css = _worksheet_css(font_dir, page_bottom_margin_in=0 if math_mode else 0.65)
+    css = _worksheet_css(font_dir, page_bottom_margin_in=0 if math_mode else 0.65,
+                         mcq_margin_pt=33 if math_mode else 11)
     diff_num = _DIFFICULTY_ORDINAL.get(difficulty, 1)
     if page_subtitle is None:
         page_subtitle = f"{_display_name(skill)} {diff_num}"
@@ -1653,21 +1662,24 @@ def _load_bank(content: Path, meta: Path, legacy: Path, legacy_expl: Path) -> di
                 f"{'math' if 'math' in content.name else 'rw'}"
             )
         content_data, meta_data = _read_json(content), _read_json(meta)
-        return {
+        bank = {
             qid: {**content_data.get(qid, {}), **meta_data.get(qid, {})}
             for qid in content_data.keys() | meta_data.keys()
         }
-
-    if not legacy.exists():
+    elif not legacy.exists():
         raise FileNotFoundError(
             f"No question bank found — expected {content.name} + {meta.name}, "
             f"or the pre-split {legacy.name}."
         )
-    bank = _read_json(legacy)
-    if legacy_expl.exists():
-        for qid, rec in _read_json(legacy_expl).items():
-            if "explanation" in rec:
-                bank.setdefault(qid, {}).setdefault("explanation", rec["explanation"])
+    else:
+        bank = _read_json(legacy)
+        if legacy_expl.exists():
+            for qid, rec in _read_json(legacy_expl).items():
+                if "explanation" in rec:
+                    bank.setdefault(qid, {}).setdefault("explanation", rec["explanation"])
+
+    for dup_id in DUPLICATE_IDS:
+        bank.pop(dup_id, None)
     return bank
 
 
