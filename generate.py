@@ -1054,7 +1054,7 @@ def build_worksheet_html(
     # _BALANCE_SCRATCH_SPACE) — a nonzero @page bottom margin would stack on
     # top of that and double-count blank space at the bottom of the page.
     css = _worksheet_css(font_dir, page_bottom_margin_in=0 if math_mode else 0.65,
-                         mcq_margin_pt=33 if math_mode else 11)
+                         mcq_margin_pt=33)
     diff_num = _DIFFICULTY_ORDINAL.get(difficulty, 1)
     if page_subtitle is None:
         page_subtitle = f"{_display_name(skill)} {diff_num}"
@@ -1350,10 +1350,12 @@ async def render_worksheet(
     **html_kwargs,
 ) -> None:
     pdf_filename = html_kwargs.pop("pdf_filename", None)
+    math_mode = html_kwargs.get("math_mode", False)
     html = build_worksheet_html(skill, difficulty, questions, font_dir, **html_kwargs)
     await page.set_content(html, wait_until="networkidle")
     await page.evaluate(_DOM_FIXUPS)
-    await _balance_scratch_space(page)
+    if math_mode:
+        await _balance_scratch_space(page)
 
     diff_num = _DIFFICULTY_ORDINAL.get(difficulty, 1)
     filename = pdf_filename or f"{_display_name(skill)} {diff_num}.pdf"
@@ -1618,7 +1620,8 @@ async def render_answer_key(
     )
     await page.set_content(html, wait_until="networkidle")
     await page.evaluate(_DOM_FIXUPS)
-    await _balance_scratch_space(page)
+    if math_mode:
+        await _balance_scratch_space(page)
     await page.pdf(
         path=str(out_dir / pdf_filename),
         format="Letter",
