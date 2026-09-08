@@ -2765,9 +2765,6 @@ async def _practice_test_worker(
         for test_key in tests:
             test_display = _test_display(test_key)
             subj_data    = test_data.get(test_key, {})
-            test_dir     = out_dir / test_key
-            modules_dir  = test_dir / "Modules"
-            modules_dir.mkdir(parents=True, exist_ok=True)
             module_pdfs  = []
             module_keys  = []
 
@@ -2776,7 +2773,7 @@ async def _practice_test_worker(
                 if not qids:
                     continue
                 pdf_path, key_path, no_svg_data, missing = await _render_module_pdf(
-                    page, test_key, subj, mod_num, qids, questions, modules_dir, font_dir,
+                    page, test_key, subj, mod_num, qids, questions, out_dir, font_dir,
                     explanations, sheet_answers,
                 )
                 module_pdfs.append(pdf_path)
@@ -2790,7 +2787,7 @@ async def _practice_test_worker(
                     reader = PdfReader(str(pdf_path))
                     for pg in reader.pages:
                         writer.add_page(pg)
-                with open(test_dir / f"{test_key}.pdf", "wb") as f:
+                with open(out_dir / f"{test_key}.pdf", "wb") as f:
                     writer.write(f)
 
             if module_keys:
@@ -2799,20 +2796,19 @@ async def _practice_test_worker(
                     reader = PdfReader(str(key_path))
                     for pg in reader.pages:
                         writer.add_page(pg)
-                with open(test_dir / f"{test_key}~Key.pdf", "wb") as f:
+                with open(out_dir / f"{test_key}~Key.pdf", "wb") as f:
                     writer.write(f)
 
             second_dir = _PRACTICE_TEST_SECOND_OUT / test_key
             second_dir.mkdir(parents=True, exist_ok=True)
             for fname in (f"{test_key}.pdf", f"{test_key}~Key.pdf"):
-                src = test_dir / fname
+                src = out_dir / fname
                 if src.exists():
                     shutil.copy2(src, second_dir / fname)
             second_modules_dir = second_dir / "Modules"
             second_modules_dir.mkdir(parents=True, exist_ok=True)
-            for f in modules_dir.iterdir():
-                if f.is_file():
-                    shutil.copy2(f, second_modules_dir / f.name)
+            for pdf_path in module_pdfs + module_keys:
+                shutil.copy2(pdf_path, second_modules_dir / pdf_path.name)
 
             progress.append(test_key)
             print(f"  [{len(progress)}] {test_display} — {len(module_pdfs)} modules")
