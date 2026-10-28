@@ -67,6 +67,15 @@ _RW_BANK   = _REPO / "reading-question-bank.json"
 _MATH_EXPL = _REPO / "math-question-bank-explanations.json"
 _RW_EXPL   = _REPO / "reading-question-bank-explanations.json"
 
+# Practice-test-only questions (e.g. a05rw318: SAT 5, RW, module 3, question 18)
+# are in none of College Board's banks, so the scrape can't have them. Their
+# content is kept in tpa's own banks, in this same record shape; it is read from
+# there rather than copied, so the two can't drift.
+_TPA_DATA        = _REPO.parent / "tpa/client/src/data"
+_TPA_MATH_BANK   = _TPA_DATA / "math-question-bank.json"
+_TPA_RW_BANK     = _TPA_DATA / "reading-question-bank.json"
+_CUSTOM_ID       = re.compile(r"^a\d{2}(rw|ma)\d{3}$")
+
 MASTER_SS_ID = "1XoANqHEGfOCdO1QBVnbA3GH-z7-_FMYwoy7Ft4ojulE"
 QB_DATA_GID  = "187852995"   # "Question bank data" tab
 QB_DATA_URL  = (
@@ -1647,7 +1656,17 @@ def _read_json(path: Path) -> dict:
         return json.load(f)
 
 
-def _load_bank(content: Path, meta: Path, legacy: Path, legacy_expl: Path) -> dict:
+def _load_custom(path: Path) -> dict:
+    """The custom (practice-test-only) records in one of tpa's banks, or {} when
+    there is no tpa checkout. A missing one only matters to a practice test that
+    uses it, which says so (see _require_custom_questions)."""
+    if not path.exists():
+        return {}
+    return {qid: rec for qid, rec in _read_json(path).items() if _CUSTOM_ID.match(qid)}
+
+
+def _load_bank(content: Path, meta: Path, legacy: Path, legacy_expl: Path,
+               custom: Path | None = None) -> dict:
     """Merge a content/meta bank pair into {qid: record} with every field.
 
     Falls back to the pre-split single-file bank (plus its explanations file,
@@ -1681,17 +1700,20 @@ def _load_bank(content: Path, meta: Path, legacy: Path, legacy_expl: Path) -> di
                 if "explanation" in rec:
                     bank.setdefault(qid, {}).setdefault("explanation", rec["explanation"])
 
+    if custom:
+        bank.update(_load_custom(custom))
+
     for dup_id in DUPLICATE_IDS:
         bank.pop(dup_id, None)
     return bank
 
 
 def load_math_bank() -> dict:
-    return _load_bank(_MATH_CONTENT, _MATH_META, _MATH_BANK, _MATH_EXPL)
+    return _load_bank(_MATH_CONTENT, _MATH_META, _MATH_BANK, _MATH_EXPL, _TPA_MATH_BANK)
 
 
 def load_rw_bank() -> dict:
-    return _load_bank(_RW_CONTENT, _RW_META, _RW_BANK, _RW_EXPL)
+    return _load_bank(_RW_CONTENT, _RW_META, _RW_BANK, _RW_EXPL, _TPA_RW_BANK)
 
 
 def load_banks() -> dict:
@@ -2691,6 +2713,22 @@ def load_test_data(master_rows: list[dict]) -> dict:
     return result
 
 
+def _require_custom_questions(test_data: dict, tests: list, questions: dict) -> None:
+    """Stop, naming them, when a practice test slot holds a custom question the
+    banks don't have -- otherwise the PDF would silently come out with a hole."""
+    missing = sorted({
+        qid
+        for test in tests for modules in test_data[test].values()
+        for qids in modules.values() for qid in qids
+        if _CUSTOM_ID.match(qid) and qid not in questions
+    })
+    if missing:
+        raise SystemExit(
+            f"Custom questions not found in {_TPA_DATA} (is tpa checked out beside this repo?): "
+            + ", ".join(missing)
+        )
+
+
 async def _render_module_pdf(
     page,
     test_key: str,
@@ -2841,6 +2879,7 @@ async def run_practice_tests(args) -> None:
 
     test_data = load_test_data(master_rows)
     available = [t for t in target_tests if t in test_data]
+    _require_custom_questions(test_data, available, questions)
     missing   = [t for t in target_tests if t not in test_data]
     if missing:
         print(f"  Warning: no data for {missing}")
